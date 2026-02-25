@@ -85,3 +85,16 @@ AGENTS.md
 data/**/*.db
 data/**/*.db-wal
 data/**/*.db-shm
+
+# Internal working docs (keep local only)
+docs/PHASE_*
+docs/PHASE*
+docs/E2E_*
+docs/PROMPT_*
+docs/REFACTOR_*
+docs/REQUIREMENTS_*
+docs/UI_NORTH_STAR.md
+docs/TESTING_NOTES.md
+docs/SCENARIO_*
+docs/HANDOFF_*
+docs/DEEP_DIVE_*
