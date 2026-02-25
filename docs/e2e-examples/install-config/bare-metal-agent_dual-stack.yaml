@@ -1,0 +1,29 @@
+# install-config dual-stack (4.20). Source: Agent doc 9.1.2 Network parameters; IPv4 and IPv6 in same order.
+# https://docs.redhat.com/en/documentation/openshift_container_platform/4.20/html/installing_an_on-premise_cluster_with_the_agent-based_installer/installation-config-parameters-agent
+apiVersion: v1
+baseDomain: example.com
+metadata:
+  name: agent-cluster
+compute:
+  - name: worker
+    replicas: 0
+controlPlane:
+  name: master
+  replicas: 3
+networking:
+  networkType: OVNKubernetes
+  machineNetwork:
+    - cidr: 10.0.0.0/16
+    - cidr: fd00::/48
+  clusterNetwork:
+    - cidr: 10.128.0.0/14
+      hostPrefix: 23
+    - cidr: fd01::/48
+      hostPrefix: 64
+  serviceNetwork:
+    - 172.30.0.0/16
+    - fd02::/112
+platform:
+  baremetal: {}
+pullSecret: '{"auths":{}}'
+sshKey: ''

@@ -1,0 +1,5 @@
+{
+  "results": [
+    { "id": "community:example-community-operator", "name": "example-community-operator", "displayName": "Example Community Operator", "defaultChannel": "stable", "catalog": "community" }
+  ]
+}

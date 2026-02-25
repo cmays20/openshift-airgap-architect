@@ -1,0 +1,82 @@
+{
+  "version": "1",
+  "parameters": [
+    {
+      "key": "release.minor",
+      "yamlPath": null,
+      "dataType": "string",
+      "allowedValues": ["4.17", "4.18", "4.19", "4.20"],
+      "documentedDefault": null,
+      "required": true,
+      "tooltip": "OpenShift minor version (4.17–4.20)",
+      "docRef": { "docId": "installation_configuration", "section": "version_choice" },
+      "applicability": { "platform": "*", "versionRange": "*", "installFamily": "*", "installMethod": "*" }
+    },
+    {
+      "key": "release.patch",
+      "yamlPath": null,
+      "dataType": "string",
+      "allowedValues": [],
+      "documentedDefault": null,
+      "required": true,
+      "tooltip": "Patch version; populated from chosen minor",
+      "docRef": { "docId": "installation_configuration", "section": "version_choice" },
+      "applicability": { "platform": "*", "versionRange": "*", "installFamily": "*", "installMethod": "*" }
+    },
+    {
+      "key": "clusterName",
+      "yamlPath": "metadata.name",
+      "dataType": "string",
+      "allowedValues": null,
+      "documentedDefault": null,
+      "required": true,
+      "tooltip": "Cluster name; used in DNS and resources",
+      "docRef": { "docId": "installation_configuration", "section": "cluster_identity" },
+      "applicability": { "platform": "*", "versionRange": "*", "installFamily": "*", "installMethod": "*" }
+    },
+    {
+      "key": "baseDomain",
+      "yamlPath": "baseDomain",
+      "dataType": "string",
+      "allowedValues": null,
+      "documentedDefault": null,
+      "required": true,
+      "tooltip": "Base domain for the cluster",
+      "docRef": { "docId": "installation_configuration", "section": "cluster_identity" },
+      "applicability": { "platform": "*", "versionRange": "*", "installFamily": "*", "installMethod": "*" }
+    },
+    {
+      "key": "machineNetworkV4",
+      "yamlPath": "networking.machineNetwork[0].cidr",
+      "dataType": "cidr",
+      "allowedValues": null,
+      "documentedDefault": null,
+      "required": true,
+      "tooltip": "Machine network IPv4 CIDR; node IPs live here",
+      "docRef": { "docId": "installation_configuration", "section": "networking" },
+      "applicability": { "platform": "*", "versionRange": "*", "installFamily": "*", "installMethod": "*" }
+    },
+    {
+      "key": "apiVip",
+      "yamlPath": "platform.baremetal.apiVIP",
+      "dataType": "ipv4",
+      "allowedValues": null,
+      "documentedDefault": null,
+      "required": false,
+      "tooltip": "API virtual IP (Bare Metal)",
+      "docRef": { "docId": "installation_configuration", "section": "bare_metal_vips" },
+      "applicability": { "platform": "Bare Metal", "versionRange": "*", "installFamily": "*", "installMethod": "*" }
+    },
+    {
+      "key": "ingressVip",
+      "yamlPath": "platform.baremetal.ingressVIP",
+      "dataType": "ipv4",
+      "allowedValues": null,
+      "documentedDefault": null,
+      "required": false,
+      "tooltip": "Ingress virtual IP (Bare Metal)",
+      "docRef": { "docId": "installation_configuration", "section": "bare_metal_vips" },
+      "applicability": { "platform": "Bare Metal", "versionRange": "*", "installFamily": "*", "installMethod": "*" }
+    }
+  ]
+}

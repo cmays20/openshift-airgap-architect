@@ -1,0 +1,13 @@
+# Canonical minimal agent-config (4.20). Source: Agent-based Installer Ch 9.2.
+# https://docs.redhat.com/en/documentation/openshift_container_platform/4.20/html/installing_an_on-premise_cluster_with_the_agent-based_installer/installation-config-parameters-agent
+apiVersion: v1beta1
+kind: AgentConfig
+metadata:
+  name: agent-config
+rendezvousIP: 192.168.1.10
+hosts:
+  - hostname: master-0
+    role: master
+    interfaces:
+      - name: eth0
+        macAddress: 52:54:00:00:00:01

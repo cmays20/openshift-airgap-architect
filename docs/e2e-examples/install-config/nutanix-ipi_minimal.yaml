@@ -1,0 +1,42 @@
+# Synthetic from params — no full-file example in 4.20 docs for Nutanix IPI.
+# Structure from data/params/4.20/nutanix-ipi.json and docs-index installing-nutanix-ipi.
+# Sources: https://docs.redhat.com/en/documentation/openshift_container_platform/4.20/html/installing_on_nutanix/
+apiVersion: v1
+baseDomain: example.com
+metadata:
+  name: airgap-cluster
+compute:
+  - name: worker
+    replicas: 0
+    architecture: amd64
+controlPlane:
+  name: master
+  replicas: 3
+  architecture: amd64
+networking:
+  networkType: OVNKubernetes
+  machineNetwork:
+    - cidr: 10.90.0.0/24
+  clusterNetwork:
+    - cidr: 10.128.0.0/14
+      hostPrefix: 23
+  serviceNetwork:
+    - 172.30.0.0/16
+platform:
+  nutanix:
+    prismCentral:
+      endpoint: prism-central.example.com
+      port: 9440
+      username: ''
+      password: ''
+    subnetUUIDs:
+      - subnet-uuid-placeholder
+pullSecret: '{"auths":{}}'
+sshKey: ''
+imageDigestSources:
+  - source: quay.io/openshift-release-dev/ocp-release
+    mirrors:
+      - registry.local:5000/ocp-release
+  - source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
+    mirrors:
+      - registry.local:5000/ocp-v4.0-art-dev

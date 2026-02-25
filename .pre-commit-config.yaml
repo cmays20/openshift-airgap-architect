@@ -1,0 +1,10 @@
+# Pre-commit hooks. Install: pre-commit install
+# Secret scan runs only if gitleaks is installed; CI runs gitleaks always.
+repos:
+  - repo: local
+    hooks:
+      - id: check-secrets
+        name: check-secrets
+        entry: bash scripts/check-secrets.sh .
+        language: system
+        pass_filenames: false

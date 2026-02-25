@@ -1,0 +1,89 @@
+{
+  "version": "1",
+  "mvpSteps": [
+    {
+      "stepNumber": 0,
+      "id": "start",
+      "label": "Start",
+      "description": "Choose a path to get started",
+      "subSteps": [],
+      "requiredOutputs": []
+    },
+    {
+      "stepNumber": 1,
+      "id": "blueprint",
+      "label": "Blueprint",
+      "description": "Platform, architecture, install family, connectivity",
+      "subSteps": [],
+      "requiredOutputs": [],
+      "locks": ["release", "platform", "installFamily", "connectivity"]
+    },
+    {
+      "stepNumber": 2,
+      "id": "methodology",
+      "label": "Methodology",
+      "description": "Choose install method (Help me choose)",
+      "subSteps": [],
+      "requiredOutputs": [],
+      "dependsOnLock": true
+    },
+    {
+      "stepNumber": 3,
+      "id": "global",
+      "label": "Global Strategy",
+      "description": "Cluster identity, network-wide, VIPs, DHCP vs Static, advanced",
+      "subSteps": [
+        { "id": "network-wide", "label": "Network-wide" },
+        { "id": "vips-ingress", "label": "VIPs and ingress" },
+        { "id": "dhcp-static", "label": "DHCP vs Static plan" },
+        { "id": "advanced-networking", "label": "Advanced networking", "collapsedByDefault": true }
+      ],
+      "requiredOutputs": []
+    },
+    {
+      "stepNumber": 4,
+      "id": "inventory",
+      "label": "Host Inventory",
+      "description": "Hosts, VIPs, BMC (Bare Metal Agent/IPI only)",
+      "subSteps": [],
+      "requiredOutputs": []
+    },
+    {
+      "stepNumber": 5,
+      "id": "operators",
+      "label": "Operators",
+      "description": "Operator catalog and selections",
+      "subSteps": [],
+      "requiredOutputs": []
+    },
+    {
+      "stepNumber": 6,
+      "id": "review",
+      "label": "Assets & Guide",
+      "description": "Canonical YAML output and export",
+      "subSteps": [],
+      "requiredOutputs": ["install-config.yaml", "agent-config.yaml"]
+    },
+    {
+      "stepNumber": 7,
+      "id": "run-oc-mirror",
+      "label": "Run oc-mirror",
+      "description": "Run oc-mirror now (coming soon)",
+      "subSteps": [],
+      "requiredOutputs": []
+    },
+    {
+      "stepNumber": 8,
+      "id": "operations",
+      "label": "Operations",
+      "description": "Jobs, oc-mirror, docs update",
+      "subSteps": [],
+      "requiredOutputs": []
+    }
+  ],
+  "outOfScopePlaceholders": [
+    { "id": "hosts", "label": "Hosts", "reason": "Planned in a later release" },
+    { "id": "storage", "label": "Storage", "reason": "Planned in a later release" },
+    { "id": "discovery-iso", "label": "Discovery ISO", "reason": "Planned in a later release" }
+  ]
+}

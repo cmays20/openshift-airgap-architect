@@ -1,0 +1,5 @@
+{
+  "results": [
+    { "id": "certified:gpu-operator-certified", "name": "gpu-operator-certified", "displayName": "NVIDIA GPU Operator", "defaultChannel": "stable", "catalog": "certified" }
+  ]
+}

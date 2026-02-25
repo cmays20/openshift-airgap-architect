@@ -1,0 +1,52 @@
+name: CI
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject committed junk (node_modules, caches, tools)
+        run: |
+          junk=$(git ls-files | grep -E 'node_modules/|/cache/|/tools/|frontend/dist/|\.code-workspace$' || true)
+          if [ -n "$junk" ]; then
+            echo "::error::These files must not be committed (add to .gitignore and remove from index):"
+            echo "$junk"
+            exit 1
+          fi
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Backend install and test
+        run: |
+          cd backend && npm ci && npm test
+
+      - name: Frontend install, build, test
+        run: |
+          cd frontend && npm ci && npm run build && npm run test
+
+      - name: Validate docs index
+        run: node scripts/validate-docs-index.js
+
+      - name: Validate params catalog
+        run: node scripts/validate-catalog.js data/params
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

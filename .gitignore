@@ -1,0 +1,71 @@
+node_modules/
+**/node_modules/
+.env
+.env.*
+!.env.example
+frontend/dist/
+backend/.tmp/
+*.log
+**/*.log
+.DS_Store
+**/.DS_Store
+.cursor/
+.cursorrules
+AGENTS.md
+
+# Secrets and credentials (do not commit)
+pull-secret
+pull-secret.*
+**/pull-secret
+**/pull-secret.*
+auth.json
+**/auth.json
+registry-auth.json
+**/registry-auth.json
+*.kubeconfig
+**/*.kubeconfig
+kubeconfig
+**/kubeconfig
+*.pem
+**/secrets/
+**/.secrets/
+*.key
+!*.key.example
+!**/*.key.example
+*.crt
+*.cer
+*.p12
+*.pfx
+# Container auth (e.g. Docker ~/.docker/config.json)
+config.json
+**/config.json
+.envrc
+**/.envrc
+
+# Backend-downloaded installers and stream cache (do not commit)
+data/tools/
+data/cache/
+/data/
+**/openshift-install-*
+**/openshift-install-*.tar.gz
+# When DATA_DIR is backend/ (e.g. local dev)
+backend/tools/
+backend/cache/
+
+# E2E matrix outputs (Workstream K; may contain placeholder secrets)
+e2e-artifacts
+e2e-artifacts/
+**/e2e-artifacts
+**/e2e-artifacts/
+
+# E2E doc crawl outputs (regeneratable; do not commit)
+docs/e2e-examples/snippets/
+docs/e2e-examples/SNIPPETS_INVENTORY.md
+docs/e2e-examples/nmstate/
+
+# IDE and tool caches (do not commit)
+*.code-workspace
+**/.vite/
+**/.eslintcache
+**/.turbo/
+.npm

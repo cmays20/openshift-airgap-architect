@@ -1,0 +1,1080 @@
+/**
+ * Builds install-config.yaml and agent-config.yaml from app state. Platform blocks: bare metal (IPI/UPI), vSphere, AWS GovCloud, Azure Government, Nutanix.
+ * State keys follow camelCase (blueprint, globalStrategy, hostInventory, platformConfig, etc.). A2: bare-metal UPI emits platform = none for controlPlane/compute.
+ */
+import yaml from "js-yaml";
+import { getTrustBundlePolicies } from "./versionPolicy.js";
+
+const normalizePullSecretString = (input) => {
+  if (!input) return "{\"auths\":{}}";
+  const raw = typeof input === "string" ? input : JSON.stringify(input);
+  try {
+    const parsed = JSON.parse(raw);
+    const withAuths = parsed.auths ? parsed : { auths: parsed };
+    return JSON.stringify(withAuths);
+  } catch {
+    return raw.trim();
+  }
+};
+
+/** Dual-stack: clusterNetwork must have IPv4 then IPv6 entries when machineNetworkV6 is set (4.20 doc). */
+const buildClusterNetwork = (networkingState, dualStack) => {
+  if (!dualStack) {
+    if (!networkingState.clusterNetworkCidr) return null;
+    return [{ cidr: networkingState.clusterNetworkCidr, hostPrefix: Number(networkingState.clusterNetworkHostPrefix || 23) }];
+  }
+  const ipv4Cidr = networkingState.clusterNetworkCidr || "10.128.0.0/14";
+  const ipv4Prefix = Number(networkingState.clusterNetworkHostPrefix || 23);
+  const ipv6Cidr = networkingState.clusterNetworkCidrV6 || "fd01::/48";
+  const ipv6Prefix = Number(networkingState.clusterNetworkHostPrefixV6 ?? 64);
+  return [
+    { cidr: ipv4Cidr, hostPrefix: ipv4Prefix },
+    { cidr: ipv6Cidr, hostPrefix: ipv6Prefix }
+  ];
+};
+
+/** Dual-stack: serviceNetwork must have IPv4 then IPv6 entries when machineNetworkV6 is set (4.20 doc). */
+const buildServiceNetwork = (networkingState, dualStack) => {
+  if (!dualStack) {
+    return networkingState.serviceNetworkCidr ? [networkingState.serviceNetworkCidr] : null;
+  }
+  const ipv4 = networkingState.serviceNetworkCidr || "172.30.0.0/16";
+  const ipv6 = networkingState.serviceNetworkCidrV6 || "fd02::/112";
+  return [ipv4, ipv6];
+};
+
+// Deferred per PHASE_5_GAP_REMEDIATION_AND_CARRYOVER.md: featureSet, arbiter.*, imageContentSources (we use imageDigestSources), credentialsMode/publish for bare metal (cloud-only in generate).
+const buildInstallConfig = (state) => {
+  const mirror = state.globalStrategy?.mirroring || {};
+  const imageDigestSources = mirror.sources?.map((s) => ({
+    source: s.source,
+    mirrors: s.mirrors
+  }));
+
+  const nodes = (state.hostInventory?.nodes || []).slice();
+  const sortedNodes = sortNodes(nodes);
+  const masters = sortedNodes.filter((node) => node.role === "master").length || 0;
+  const workers = sortedNodes.filter((node) => node.role === "worker").length || 0;
+  const rendezvousIP = sortedNodes.find((node) => node.role === "master")?.primary?.ipv4Cidr?.split("/")?.[0] || "192.168.1.10";
+
+  const networkingState = state.globalStrategy?.networking || {};
+  const machineNetworks = [networkingState.machineNetworkV4, networkingState.machineNetworkV6]
+    .filter(Boolean)
+    .map((cidr) => ({ cidr }));
+  const dualStack = Boolean(networkingState.machineNetworkV6);
+
+  const includeCredentials = Boolean(state.exportOptions?.includeCredentials);
+  const creds = state.credentials || {};
+  const useAnonymousPullSecret = Boolean(
+    creds.usingMirrorRegistry && creds.mirrorRegistryUnauthenticated
+  );
+  const registryFqdn = state.globalStrategy?.mirroring?.registryFqdn || "registry.local:5000";
+  const anonymousPullSecretPayload = JSON.stringify({
+    auths: { [registryFqdn]: { auth: "aWQ6cGFzcwo=", email: "" } }
+  });
+  const rawPullSecret = includeCredentials
+    ? useAnonymousPullSecret
+      ? anonymousPullSecretPayload
+      : creds.pullSecretPlaceholder || "{\"auths\":{}}"
+    : "{\"auths\":{}}";
+  const pullSecret = normalizePullSecretString(rawPullSecret);
+
+  const platformConfig = state.platformConfig || {};
+
+  // Blueprint carry-over: architecture (x86_64→amd64, aarch64→arm64) and platform (Bare Metal→baremetal, etc.)
+  const archForInstallConfig = (arch) => {
+    if (!arch) return undefined;
+    if (arch === "x86_64") return "amd64";
+    if (arch === "aarch64") return "arm64";
+    return arch; // ppc64le, s390x pass through
+  };
+  const platformKey = normalizePlatformKey(state.blueprint?.platform);
+
+  const clusterNetwork = buildClusterNetwork(networkingState, dualStack);
+  const serviceNetwork = buildServiceNetwork(networkingState, dualStack);
+
+  // K follow-up: controlPlane.platform and compute[].platform are optional per 4.20 params. Emit only when
+  // required: (1) bare-metal UPI → "none"; (2) AWS GovCloud IPI → object with aws.type when instance types set.
+  const installConfig = {
+    apiVersion: "v1",
+    baseDomain: state.blueprint?.baseDomain || "example.com",
+    metadata: { name: state.blueprint?.clusterName || "airgap-cluster" },
+    compute: [
+      {
+        name: "worker",
+        replicas: workers,
+        ...(archForInstallConfig(state.blueprint?.arch) ? { architecture: archForInstallConfig(state.blueprint.arch) } : {})
+      }
+    ],
+    controlPlane: {
+      name: "master",
+      replicas: masters || 3,
+      ...(archForInstallConfig(state.blueprint?.arch) ? { architecture: archForInstallConfig(state.blueprint.arch) } : {})
+    },
+    networking: {
+      networkType: networkingState.networkType || "OVNKubernetes",
+      ...(machineNetworks.length ? { machineNetwork: machineNetworks } : {}),
+      ...(clusterNetwork ? { clusterNetwork } : {}),
+      ...(serviceNetwork ? { serviceNetwork } : {}),
+      ...(networkingState.ovnInternalJoinSubnet
+        ? { ovnKubernetesConfig: { ipv4: { internalJoinSubnet: networkingState.ovnInternalJoinSubnet } } }
+        : {})
+    },
+    platform: {
+      [normalizePlatformKey(state.blueprint?.platform)]: {}
+    },
+    pullSecret,
+    sshKey: state.credentials?.sshPublicKey || ""
+  };
+
+  // A2: For bare-metal UPI, installer expects controlPlane/compute platform = none (user-provisioned machines).
+  if (state.blueprint?.platform === "Bare Metal" && state.methodology?.method === "UPI") {
+    installConfig.controlPlane.platform = "none";
+    installConfig.compute[0].platform = "none";
+  }
+
+  if (state.blueprint?.platform === "Bare Metal") {
+    const baremetal = {
+      ...(state.hostInventory?.apiVip ? { apiVIP: state.hostInventory.apiVip } : {}),
+      ...(state.hostInventory?.ingressVip ? { ingressVIP: state.hostInventory.ingressVip } : {})
+    };
+    if (state.methodology?.method === "IPI") {
+      const hi = state.hostInventory || {};
+      if (hi.provisioningNetwork && ["Managed", "Unmanaged", "Disabled"].includes(hi.provisioningNetwork)) {
+        baremetal.provisioningNetwork = hi.provisioningNetwork;
+      }
+      if (hi.provisioningNetworkCIDR) baremetal.provisioningNetworkCIDR = hi.provisioningNetworkCIDR;
+      if (hi.provisioningNetworkInterface) baremetal.provisioningNetworkInterface = hi.provisioningNetworkInterface;
+      if (hi.provisioningDHCPRange) baremetal.provisioningDHCPRange = hi.provisioningDHCPRange;
+      if (hi.clusterProvisioningIP) baremetal.clusterProvisioningIP = hi.clusterProvisioningIP;
+      if (hi.provisioningMACAddress) baremetal.provisioningMACAddress = hi.provisioningMACAddress;
+      const hosts = (hi.nodes || []).map((node) => {
+        const host = {
+          name: node.hostname,
+          role: node.role
+        };
+        const bmcAddr = (node.bmc?.address || "").trim();
+        if (bmcAddr) {
+          host.bmc = {
+            address: bmcAddr,
+            ...(includeCredentials && node.bmc?.username ? { username: node.bmc.username } : {}),
+            ...(includeCredentials && node.bmc?.password ? { password: node.bmc.password } : {}),
+            ...(node.bmc?.disableCertificateVerification === true ? { disableCertificateVerification: true } : {})
+          };
+        }
+        if ((node.bmc?.bootMACAddress || "").trim()) host.bootMACAddress = (node.bmc.bootMACAddress || "").trim();
+        if ((node.rootDevice || "").trim()) host.rootDeviceHints = { deviceName: (node.rootDevice || "").trim() };
+        return host;
+      });
+      baremetal.hosts = hosts;
+    }
+    installConfig.platform.baremetal = baremetal;
+  }
+
+  if (state.globalStrategy?.fips) {
+    installConfig.fips = true;
+  }
+
+  // Gap remediation (Advanced): hyperthreading, capabilities, cpuPartitioningMode when state has them
+  if (platformConfig.computeHyperthreading === "Enabled" || platformConfig.computeHyperthreading === "Disabled") {
+    installConfig.compute[0].hyperthreading = platformConfig.computeHyperthreading;
+  }
+  if (platformConfig.controlPlaneHyperthreading === "Enabled" || platformConfig.controlPlaneHyperthreading === "Disabled") {
+    installConfig.controlPlane.hyperthreading = platformConfig.controlPlaneHyperthreading;
+  }
+  if (platformConfig.baselineCapabilitySet || (Array.isArray(platformConfig.additionalEnabledCapabilities) && platformConfig.additionalEnabledCapabilities.length > 0)) {
+    installConfig.capabilities = {};
+    if (platformConfig.baselineCapabilitySet) installConfig.capabilities.baselineCapabilitySet = platformConfig.baselineCapabilitySet;
+    if (Array.isArray(platformConfig.additionalEnabledCapabilities) && platformConfig.additionalEnabledCapabilities.length > 0) {
+      installConfig.capabilities.additionalEnabledCapabilities = platformConfig.additionalEnabledCapabilities;
+    }
+  }
+  if (platformConfig.cpuPartitioningMode === "None" || platformConfig.cpuPartitioningMode === "AllNodes") {
+    installConfig.cpuPartitioningMode = platformConfig.cpuPartitioningMode;
+  }
+
+  if (state.globalStrategy?.proxyEnabled) {
+    installConfig.proxy = {
+      httpProxy: state.globalStrategy?.proxies?.httpProxy,
+      httpsProxy: state.globalStrategy?.proxies?.httpsProxy,
+      noProxy: state.globalStrategy?.proxies?.noProxy
+    };
+  }
+
+  if (Array.isArray(imageDigestSources) && imageDigestSources.length > 0) {
+    installConfig.imageDigestSources = imageDigestSources;
+  }
+
+  if (state.blueprint?.platform === "AWS GovCloud" || state.blueprint?.platform === "Azure Government") {
+    if (platformConfig.publish) {
+      installConfig.publish = platformConfig.publish;
+    }
+    if (platformConfig.credentialsMode) {
+      installConfig.credentialsMode = platformConfig.credentialsMode;
+    }
+  }
+
+  if (state.blueprint?.platform === "AWS GovCloud" && ["IPI", "UPI"].includes(state.methodology?.method)) {
+    const aws = {};
+    if (platformConfig.aws?.region) aws.region = platformConfig.aws.region;
+    if (platformConfig.aws?.hostedZone) aws.hostedZone = platformConfig.aws.hostedZone;
+    if (platformConfig.aws?.hostedZoneRole) aws.hostedZoneRole = platformConfig.aws.hostedZoneRole;
+    if (platformConfig.aws?.lbType) aws.lbType = platformConfig.aws.lbType;
+    if (platformConfig.aws?.subnets) {
+      aws.subnets = platformConfig.aws.subnets.split(",").map((s) => s.trim()).filter(Boolean);
+    }
+    if (platformConfig.aws?.amiId) aws.amiID = platformConfig.aws.amiId;
+    if (Object.keys(aws).length) {
+      installConfig.platform.aws = aws;
+    }
+    if (state.methodology?.method === "IPI" && platformConfig.aws?.controlPlaneInstanceType) {
+      const cpPlatform = typeof installConfig.controlPlane.platform === "object" && installConfig.controlPlane.platform !== null
+        ? { ...installConfig.controlPlane.platform } : {};
+      cpPlatform.aws = { type: platformConfig.aws.controlPlaneInstanceType };
+      installConfig.controlPlane.platform = cpPlatform;
+    }
+    if (state.methodology?.method === "IPI" && platformConfig.aws?.workerInstanceType) {
+      const compPlatform = typeof installConfig.compute[0].platform === "object" && installConfig.compute[0].platform !== null
+        ? { ...installConfig.compute[0].platform } : {};
+      compPlatform.aws = { type: platformConfig.aws.workerInstanceType };
+      installConfig.compute[0].platform = compPlatform;
+    }
+  }
+
+  // vSphere (IPI and UPI): supports (1) explicit failureDomains + vcenters arrays, or (2) legacy flat single vcenter/datacenter + optional single failure domain.
+  // platformConfig.vsphere: vcenter, datacenter, cluster, datastore, network, folder, resourcePool, username, password;
+  // or failureDomains[] (name, region, zone, server, topology{computeCluster, datacenter, datastore, networks[], folder?, resourcePool?}), vcenters[] (server, user?, password?, port?, datacenters[]).
+  if (state.blueprint?.platform === "VMware vSphere" && (state.methodology?.method === "IPI" || state.methodology?.method === "UPI")) {
+    const vsphere = {};
+    const vs = platformConfig.vsphere || {};
+    const explicitFailureDomains = Array.isArray(vs.failureDomains) && vs.failureDomains.length > 0;
+    const explicitVcenters = Array.isArray(vs.vcenters) && vs.vcenters.length > 0;
+
+    if (explicitFailureDomains) {
+      vsphere.failureDomains = vs.failureDomains.map((fd, i) => {
+        const top = fd.topology || {};
+        const networks = top.networks;
+        const networksArray = Array.isArray(networks) ? networks : (networks ? [networks] : []);
+        const topology = {
+          ...(top.datacenter != null && top.datacenter !== "" ? { datacenter: top.datacenter } : {}),
+          ...(top.computeCluster != null && top.computeCluster !== "" ? { computeCluster: top.computeCluster } : {}),
+          ...(top.datastore != null && top.datastore !== "" ? { datastore: top.datastore } : {}),
+          ...(networksArray.length ? { networks: networksArray } : {}),
+          ...(top.folder != null && top.folder !== "" ? { folder: top.folder } : {}),
+          ...(top.resourcePool != null && top.resourcePool !== "" ? { resourcePool: top.resourcePool } : {})
+        };
+        return {
+          name: fd.name != null && fd.name !== "" ? fd.name : `fd-${i}`,
+          region: fd.region != null && fd.region !== "" ? fd.region : (top.datacenter || "datacenter"),
+          zone: fd.zone != null && fd.zone !== "" ? fd.zone : (top.computeCluster || "cluster"),
+          server: fd.server != null && fd.server !== "" ? fd.server : "",
+          ...(Object.keys(topology).length ? { topology } : {})
+        };
+      }).filter((fd) => fd.server);
+
+      if (explicitVcenters) {
+        vsphere.vcenters = vs.vcenters.map((vc) => ({
+          server: vc.server || "",
+          user: includeCredentials ? (vc.user || "") : "",
+          password: includeCredentials ? (vc.password || "") : "",
+          datacenters: Array.isArray(vc.datacenters) ? vc.datacenters : (vc.datacenter != null ? [vc.datacenter] : []),
+          port: Number(vc.port) || 443
+        })).filter((vc) => vc.server && vc.datacenters.length > 0);
+      } else {
+        const serversSeen = new Set();
+        const vcentersFromFd = [];
+        for (const fd of vsphere.failureDomains) {
+          if (fd.server && !serversSeen.has(fd.server)) {
+            serversSeen.add(fd.server);
+            const datacenter = fd.topology?.datacenter;
+            vcentersFromFd.push({
+              server: fd.server,
+              user: includeCredentials ? (vs.username || "") : "",
+              password: includeCredentials ? (vs.password || "") : "",
+              datacenters: datacenter ? [datacenter] : [],
+              port: 443
+            });
+          }
+        }
+        vsphere.vcenters = vcentersFromFd.filter((vc) => vc.datacenters.length > 0);
+      }
+    } else {
+      const server = vs.vcenter;
+      const datacenter = vs.datacenter;
+      const cluster = vs.cluster;
+      const datastore = vs.datastore;
+      const network = vs.network;
+      if (server && datacenter) {
+        vsphere.vcenters = [
+          {
+            server,
+            user: includeCredentials ? vs.username || "" : "",
+            password: includeCredentials ? vs.password || "" : "",
+            datacenters: [datacenter],
+            port: 443
+          }
+        ];
+      }
+      if (server && datacenter && cluster && datastore && network) {
+        vsphere.failureDomains = [
+          {
+            name: "fd-0",
+            region: datacenter,
+            zone: cluster,
+            server,
+            topology: {
+              datacenter,
+              computeCluster: cluster,
+              datastore,
+              networks: [network],
+              ...(vs.folder ? { folder: vs.folder } : {}),
+              ...(vs.resourcePool ? { resourcePool: vs.resourcePool } : {})
+            }
+          }
+        ];
+      }
+    }
+
+    if (Object.keys(vsphere).length) {
+      installConfig.platform.vsphere = vsphere;
+    }
+  }
+
+  if (state.blueprint?.platform === "Nutanix" && state.methodology?.method === "IPI") {
+    const nutanix = {};
+    if (platformConfig.nutanix?.endpoint) {
+      nutanix.prismCentral = {
+        endpoint: platformConfig.nutanix.endpoint,
+        port: Number(platformConfig.nutanix.port || 9440),
+        username: includeCredentials ? platformConfig.nutanix.username || "" : "",
+        password: includeCredentials ? platformConfig.nutanix.password || "" : ""
+      };
+    }
+    if (platformConfig.nutanix?.subnet) {
+      nutanix.subnetUUIDs = [platformConfig.nutanix.subnet];
+    }
+    if (platformConfig.nutanix?.cluster) {
+      nutanix.clusterName = platformConfig.nutanix.cluster;
+    }
+    if (Object.keys(nutanix).length) {
+      installConfig.platform.nutanix = nutanix;
+    }
+  }
+
+  if (state.blueprint?.platform === "Azure Government" && state.methodology?.method === "IPI") {
+    const azure = {};
+    if (platformConfig.azure?.cloudName) azure.cloudName = platformConfig.azure.cloudName;
+    if (platformConfig.azure?.region) azure.region = platformConfig.azure.region;
+    if (platformConfig.azure?.resourceGroupName) azure.resourceGroupName = platformConfig.azure.resourceGroupName;
+    if (platformConfig.azure?.baseDomainResourceGroupName) {
+      azure.baseDomainResourceGroupName = platformConfig.azure.baseDomainResourceGroupName;
+    }
+    if (Object.keys(azure).length) {
+      installConfig.platform.azure = azure;
+    }
+  }
+
+  const trust = state.trust || {};
+  const trustBundle = buildEffectiveTrustBundle(trust);
+  if (trustBundle) {
+    installConfig.additionalTrustBundle = trustBundle;
+    const allowedPolicies = getTrustBundlePolicies(state.release?.patchVersion || "");
+    const requested = trust.additionalTrustBundlePolicy;
+    if (requested && allowedPolicies.includes(requested)) {
+      installConfig.additionalTrustBundlePolicy = requested;
+    } else if (allowedPolicies.length) {
+      const defaultPolicy = trust.mirrorRegistryCaPem
+        ? "Always"
+        : state.globalStrategy?.proxyEnabled
+          ? "Proxyonly"
+          : "Always";
+      installConfig.additionalTrustBundlePolicy = defaultPolicy;
+    }
+  }
+
+  return yaml.dump(installConfig, { lineWidth: 120 });
+};
+
+const normalizePlatformKey = (platform) => {
+  switch (platform) {
+    case "Bare Metal":
+      return "baremetal";
+    case "VMware vSphere":
+      return "vsphere";
+    case "Nutanix":
+      return "nutanix";
+    case "AWS GovCloud":
+      return "aws";
+    case "Azure Government":
+      return "azure";
+    default:
+      return "none";
+  }
+};
+
+const buildAgentConfig = (state) => {
+  const sortedNodes = sortNodes(state.hostInventory?.nodes || []);
+  const rendezvousIP = sortedNodes.find((node) => node.role === "master")?.primary?.ipv4Cidr?.split("/")?.[0] || "192.168.1.10";
+  const hosts = sortedNodes.map((node) => {
+    const nmState = buildNmState({ ...node, inventoryEnableIpv6: state.hostInventory?.enableIpv6 });
+    const interfaces = collectPhysicalInterfaces(node);
+    return {
+      hostname: node.hostname,
+      role: node.role,
+      interfaces,
+      rootDeviceHints: node.rootDevice ? { deviceName: node.rootDevice } : undefined,
+      networkConfig: nmState
+    };
+  });
+
+  const additionalNTPSources = (state.globalStrategy?.ntpServers || []).map((s) => s.trim()).filter(Boolean);
+  const bootArtifactsBaseURL = (state.hostInventory?.bootArtifactsBaseURL || "").trim();
+
+  const minimalISO = state.hostInventory?.minimalISO === true;
+  const agentConfig = {
+    apiVersion: "v1beta1",
+    kind: "AgentConfig",
+    metadata: { name: "agent-config" },
+    rendezvousIP,
+    ...(additionalNTPSources.length > 0 ? { additionalNTPSources } : {}),
+    ...(bootArtifactsBaseURL ? { bootArtifactsBaseURL } : {}),
+    ...(minimalISO ? { minimalISO: true } : {}),
+    hosts
+  };
+
+  return yaml.dump(agentConfig, { lineWidth: 120 });
+};
+
+const buildChronyConfig = (servers) => {
+  const lines = [
+    "# Managed by OpenShift Airgap Architect",
+    "# Chrony configuration generated from Global Strategy NTP settings"
+  ];
+  servers.forEach((server) => {
+    lines.push(`server ${server} iburst`);
+  });
+  lines.push("driftfile /var/lib/chrony/drift");
+  lines.push("makestep 1.0 3");
+  lines.push("rtcsync");
+  lines.push("logdir /var/log/chrony");
+  return `${lines.join("\n")}\n`;
+};
+
+const buildNtpMachineConfig = (servers, role) => {
+  const chrony = buildChronyConfig(servers);
+  const source = `data:text/plain;charset=utf-8,${encodeURIComponent(chrony)}`;
+  return {
+    apiVersion: "machineconfiguration.openshift.io/v1",
+    kind: "MachineConfig",
+    metadata: {
+      name: `99-chrony-ntp-${role}`,
+      labels: {
+        "machineconfiguration.openshift.io/role": role
+      }
+    },
+    spec: {
+      config: {
+        ignition: { version: "3.2.0" },
+        storage: {
+          files: [
+            {
+              path: "/etc/chrony.conf",
+              mode: 420,
+              overwrite: true,
+              contents: { source }
+            }
+          ]
+        }
+      }
+    }
+  };
+};
+
+const buildNtpMachineConfigs = (state) => {
+  const servers = (state.globalStrategy?.ntpServers || []).map((s) => s.trim()).filter(Boolean);
+  if (!servers.length) return {};
+  return {
+    "99-chrony-ntp-master.yaml": yaml.dump(buildNtpMachineConfig(servers, "master"), { lineWidth: 120 }),
+    "99-chrony-ntp-worker.yaml": yaml.dump(buildNtpMachineConfig(servers, "worker"), { lineWidth: 120 })
+  };
+};
+
+const extractPemBlocks = (pem) => {
+  if (!pem) return [];
+  const matches = pem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
+  if (!matches) return [];
+  return matches.map((block) => block.trim());
+};
+
+const buildEffectiveTrustBundle = (trust) => {
+  const mirrorBlocks = extractPemBlocks(trust.mirrorRegistryCaPem);
+  const proxyBlocks = extractPemBlocks(trust.proxyCaPem);
+  if (!mirrorBlocks.length && !proxyBlocks.length) return "";
+  const merged = Array.from(new Set([...mirrorBlocks, ...proxyBlocks]));
+  return merged.join("\n");
+};
+
+const buildNmState = (node) => {
+  const enableIpv6 = Boolean(node?.enableIpv6 || node?.inventoryEnableIpv6);
+  const config = {
+    interfaces: [],
+    routes: { config: [] },
+    "dns-resolver": { config: { server: [], search: [] } }
+  };
+  const dnsServers = (node.dnsServers || "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (dnsServers.length) {
+    config["dns-resolver"].config.server = dnsServers;
+  }
+  if (node.dnsSearch) {
+    config["dns-resolver"].config.search = node.dnsSearch
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+  }
+  const toNumber = (value) => {
+    if (value === undefined || value === null || value === "") return undefined;
+    const next = Number(value);
+    return Number.isNaN(next) ? undefined : next;
+  };
+
+  const addIpConfig = (iface, mode, addrV4, prefixV4, addrV6, prefixV6) => {
+    if (mode === "dhcp") {
+      iface.ipv4 = { enabled: true, dhcp: true };
+    } else if (addrV4) {
+      iface.ipv4 = { enabled: true, dhcp: false, address: [{ ip: addrV4, prefixLength: prefixV4 }] };
+    } else {
+      iface.ipv4 = { enabled: false };
+    }
+    if (enableIpv6 && addrV6) {
+      iface.ipv6 = { enabled: true, dhcp: false, address: [{ ip: addrV6, prefixLength: prefixV6 }] };
+    } else {
+      iface.ipv6 = { enabled: false };
+    }
+  };
+
+  const primary = node.primary || {};
+  const primaryIfaceName = getPrimaryInterfaceName(primary);
+  const primaryIpv4 = primary.ipv4Cidr?.split("/")?.[0];
+  const primaryIpv4Prefix = Number(primary.ipv4Cidr?.split("/")?.[1] || 24);
+  const primaryIpv6 = primary.ipv6Cidr?.split("/")?.[0];
+  const primaryIpv6Prefix = Number(primary.ipv6Cidr?.split("/")?.[1] || 64);
+
+  if (primary.mode === "static" && primary.ipv4Gateway) {
+    config.routes.config.push({
+      destination: "0.0.0.0/0",
+      "next-hop-address": primary.ipv4Gateway,
+      "next-hop-interface": primaryIfaceName,
+      "table-id": 254
+    });
+  }
+  if (enableIpv6 && primary.mode === "static" && primary.ipv6Gateway) {
+    config.routes.config.push({
+      destination: "::/0",
+      "next-hop-address": primary.ipv6Gateway,
+      "next-hop-interface": primaryIfaceName,
+      "table-id": 254
+    });
+  }
+
+  const extraRoutes = primary.advanced?.routes || [];
+  extraRoutes.forEach((route) => {
+    if (!route?.destination || !route?.nextHopAddress) return;
+    config.routes.config.push({
+      destination: route.destination,
+      "next-hop-address": route.nextHopAddress,
+      "next-hop-interface": route.nextHopInterface || primaryIfaceName,
+      "table-id": 254
+    });
+  });
+
+  const addEthernet = (name, mtu, sriov) => {
+    const entry = { name, type: "ethernet", state: "up" };
+    if (mtu) entry.mtu = mtu;
+    if (sriov) entry.sriov = sriov;
+    config.interfaces.push(entry);
+    return entry;
+  };
+
+  const addBond = (bond, mtu) => {
+    const entry = {
+      name: bond.name || "bond0",
+      type: "bond",
+      state: "up",
+      linkAggregation: {
+        mode: bond.mode || "active-backup",
+        options: { miimon: "100" },
+        port: (bond.slaves || []).map((slave) => slave.name).filter(Boolean)
+      },
+      ipv4: { enabled: false },
+      ipv6: { enabled: false }
+    };
+    if (mtu) entry.mtu = mtu;
+    config.interfaces.push(entry);
+    return entry;
+  };
+
+  const addVlan = (vlan, mtu) => {
+    const baseIface = vlan.baseIface;
+    const id = Number(vlan.id);
+    const name = vlan.name || (baseIface && vlan.id ? `${baseIface}.${vlan.id}` : "");
+    const entry = {
+      name,
+      type: "vlan",
+      state: "up",
+      vlan: { baseIface, id }
+    };
+    if (mtu) entry.mtu = mtu;
+    config.interfaces.push(entry);
+    return entry;
+  };
+
+  const baseMtu = toNumber(primary.advanced?.mtu);
+  const vlanMtu = toNumber(primary.advanced?.vlanMtu);
+  const sriovEnabled = primary.advanced?.sriov?.enabled && toNumber(primary.advanced?.sriov?.totalVfs);
+  const sriovConfig = sriovEnabled ? { "total-vfs": toNumber(primary.advanced?.sriov?.totalVfs) } : null;
+
+  if (primary.type === "ethernet") {
+    const eth = addEthernet(primary.ethernet?.name || "eth0", baseMtu, sriovConfig);
+    addIpConfig(eth, primary.mode, primaryIpv4, primaryIpv4Prefix, primaryIpv6, primaryIpv6Prefix);
+  }
+
+  if (primary.type === "bond") {
+    (primary.bond?.slaves || []).forEach((slave) => {
+      addEthernet(slave.name, baseMtu, sriovConfig);
+    });
+    const bond = addBond(primary.bond || {}, baseMtu);
+    addIpConfig(bond, primary.mode, primaryIpv4, primaryIpv4Prefix, primaryIpv6, primaryIpv6Prefix);
+  }
+
+  if (primary.type === "vlan-on-ethernet") {
+    const eth = addEthernet(primary.ethernet?.name || "eth0", baseMtu, sriovConfig);
+    const vlan = addVlan(
+      { ...primary.vlan, baseIface: primary.vlan.baseIface || eth.name },
+      vlanMtu
+    );
+    addIpConfig(vlan, primary.mode, primaryIpv4, primaryIpv4Prefix, primaryIpv6, primaryIpv6Prefix);
+  }
+
+  if (primary.type === "vlan-on-bond") {
+    (primary.bond?.slaves || []).forEach((slave) => {
+      addEthernet(slave.name, baseMtu, sriovConfig);
+    });
+    const bond = addBond(primary.bond || {}, baseMtu);
+    const vlan = addVlan(
+      { ...primary.vlan, baseIface: primary.vlan.baseIface || bond.name },
+      vlanMtu
+    );
+    addIpConfig(vlan, primary.mode, primaryIpv4, primaryIpv4Prefix, primaryIpv6, primaryIpv6Prefix);
+  }
+
+  const vrfEnabled = primary.advanced?.vrf?.enabled;
+  if (vrfEnabled) {
+    const ports = (primary.advanced?.vrf?.ports || "")
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    const vrfPorts = ports.length ? ports : [primaryIfaceName];
+    config.interfaces.push({
+      name: primary.advanced?.vrf?.name || "vrf0",
+      type: "vrf",
+      state: "up",
+      vrf: {
+        "route-table-id": toNumber(primary.advanced?.vrf?.tableId) || 100,
+        port: vrfPorts
+      }
+    });
+  }
+
+  const extraIfaces = node.additionalInterfaces || [];
+  extraIfaces.forEach((iface) => {
+    const mode = iface.mode || "dhcp";
+    const ipv4Addr = iface.ipv4Cidr?.split("/")?.[0];
+    const ipv4Prefix = Number(iface.ipv4Cidr?.split("/")?.[1] || 24);
+    const ipv6Addr = iface.ipv6Cidr?.split("/")?.[0];
+    const ipv6Prefix = Number(iface.ipv6Cidr?.split("/")?.[1] || 64);
+    const baseMtu = toNumber(iface.advanced?.mtu);
+    const vlanMtu = toNumber(iface.advanced?.vlanMtu);
+    const sriovEnabled = iface.advanced?.sriov?.enabled && toNumber(iface.advanced?.sriov?.totalVfs);
+    const sriovConfig = sriovEnabled ? { "total-vfs": toNumber(iface.advanced?.sriov?.totalVfs) } : null;
+
+    if (iface.type === "ethernet") {
+      const eth = addEthernet(iface.ethernet?.name, baseMtu, sriovConfig);
+      addIpConfig(eth, mode, ipv4Addr, ipv4Prefix, ipv6Addr, ipv6Prefix);
+    }
+    if (iface.type === "bond") {
+      (iface.bond?.slaves || []).forEach((slave) => addEthernet(slave.name, baseMtu, sriovConfig));
+      const bond = addBond(iface.bond || {}, baseMtu);
+      addIpConfig(bond, mode, ipv4Addr, ipv4Prefix, ipv6Addr, ipv6Prefix);
+    }
+    if (iface.type === "vlan-on-ethernet") {
+      const eth = addEthernet(iface.ethernet?.name, baseMtu, sriovConfig);
+      const vlan = addVlan(
+        { ...iface.vlan, baseIface: iface.vlan.baseIface || eth.name },
+        vlanMtu
+      );
+      addIpConfig(vlan, mode, ipv4Addr, ipv4Prefix, ipv6Addr, ipv6Prefix);
+    }
+    if (iface.type === "vlan-on-bond") {
+      (iface.bond?.slaves || []).forEach((slave) => addEthernet(slave.name, baseMtu, sriovConfig));
+      const bond = addBond(iface.bond || {}, baseMtu);
+      const vlan = addVlan(
+        { ...iface.vlan, baseIface: iface.vlan.baseIface || bond.name },
+        vlanMtu
+      );
+      addIpConfig(vlan, mode, ipv4Addr, ipv4Prefix, ipv6Addr, ipv6Prefix);
+    }
+  });
+
+  return config;
+};
+
+const getPrimaryInterfaceName = (primary) => {
+  if (!primary) return "eth0";
+  if (primary.type === "vlan-on-ethernet" || primary.type === "vlan-on-bond") {
+    const base = primary.vlan?.baseIface
+      || (primary.type === "vlan-on-bond" ? primary.bond?.name : primary.ethernet?.name)
+      || "eth0";
+    return primary.vlan?.name || (primary.vlan?.id ? `${base}.${primary.vlan.id}` : base);
+  }
+  if (primary.type === "bond") return primary.bond?.name || "bond0";
+  return primary.ethernet?.name || "eth0";
+};
+
+const collectPhysicalInterfaces = (node) => {
+  const interfaces = [];
+  const primary = node.primary || {};
+  if (primary.type === "bond" || primary.type === "vlan-on-bond") {
+    (primary.bond?.slaves || []).forEach((slave) => {
+      if (slave.name && slave.macAddress) {
+        interfaces.push({ name: slave.name, macAddress: slave.macAddress });
+      }
+    });
+  } else {
+    if (primary.ethernet?.name && primary.ethernet?.macAddress) {
+      interfaces.push({ name: primary.ethernet.name, macAddress: primary.ethernet.macAddress });
+    }
+  }
+  const extraIfaces = node.additionalInterfaces || [];
+  extraIfaces.forEach((iface) => {
+    if (iface.type === "bond" || iface.type === "vlan-on-bond") {
+      (iface.bond?.slaves || []).forEach((slave) => {
+        if (slave.name && slave.macAddress) {
+          interfaces.push({ name: slave.name, macAddress: slave.macAddress });
+        }
+      });
+    } else if (iface.ethernet?.name && iface.ethernet?.macAddress) {
+      interfaces.push({ name: iface.ethernet.name, macAddress: iface.ethernet.macAddress });
+    }
+  });
+  return interfaces;
+};
+
+const sortNodes = (nodes) => {
+  return nodes.slice().sort((a, b) => {
+    if (a.role !== b.role) return a.role === "master" ? -1 : 1;
+    const aMatch = a.hostname?.match(/-(\d+)$/);
+    const bMatch = b.hostname?.match(/-(\d+)$/);
+    if (aMatch && bMatch) return Number(aMatch[1]) - Number(bMatch[1]);
+    return (a.hostname || "").localeCompare(b.hostname || "");
+  });
+};
+
+const buildImageSetConfig = (state) => {
+  const version = state.release?.patchVersion;
+  const operators = state.operators?.selected || [];
+  const images = {
+    apiVersion: "mirror.openshift.io/v2alpha1",
+    kind: "ImageSetConfiguration",
+    mirror: {
+      platform: {
+        channels: [
+          {
+            name: `stable-${state.release?.channel}`,
+            minVersion: version,
+            maxVersion: version
+          }
+        ]
+      },
+      operators: []
+    }
+  };
+  const byCatalog = new Map();
+  for (const op of operators) {
+    if (!byCatalog.has(op.catalogImage)) {
+      byCatalog.set(op.catalogImage, []);
+    }
+    byCatalog.get(op.catalogImage).push({
+      name: op.name,
+      channels: [{ name: op.defaultChannel }]
+    });
+  }
+  for (const [catalog, packages] of byCatalog.entries()) {
+    images.mirror.operators.push({ catalog, packages });
+  }
+  return yaml.dump(images, { lineWidth: 120 });
+};
+
+const buildFieldManual = (state, docsLinks) => {
+  const lines = [];
+  const version = state.release?.patchVersion || "unknown";
+  const channel = state.release?.channel ? `stable-${state.release.channel}` : "unknown";
+  const connectivity = state.docs?.connectivity === "jumpbox" ? "Disconnected with Jumpbox" : "Fully Disconnected";
+  const platformConfig = state.platformConfig || {};
+  const trustBundle = buildEffectiveTrustBundle(state.trust || {});
+  const trustStatus = trustBundle
+    ? state.trust?.mirrorRegistryCaPem && state.trust?.proxyCaPem
+      ? "Both"
+      : state.trust?.mirrorRegistryCaPem
+        ? "Registry CA only"
+        : "Proxy CA only"
+    : "None";
+  const mirrorRegistry = state.globalStrategy?.mirroring?.registryFqdn || "unknown";
+  const mirrorPrivate = state.trust?.mirrorRegistryUsesPrivateCa ? "Yes" : "No";
+  const proxyEnabled = state.globalStrategy?.proxyEnabled ? "Enabled" : "Disabled";
+  const ntpServers = state.globalStrategy?.ntpServers || [];
+  const outputPath = state.mirrorWorkflow?.outputPath || "/data/oc-mirror-output";
+  const operators = state.operators?.selected || [];
+  const operatorList = operators.length
+    ? operators.map((op) => `${op.name} (${op.defaultChannel || "unknown"})`).join(", ")
+    : "None";
+  const catalogs = Array.from(new Set(operators.map((op) => op.catalogImage || op.catalog))).filter(Boolean);
+  const clusterName = state.blueprint?.clusterName || "airgap-cluster";
+  const baseDomain = state.blueprint?.baseDomain || "example.com";
+  const apiVip = state.hostInventory?.apiVip || "<api-vip>";
+  const ingressVip = state.hostInventory?.ingressVip || "<ingress-vip>";
+  const installDir = "./install-assets";
+  const imageSetName = "imageset-config.yaml";
+
+  lines.push(`# OpenShift Airgap Architect Field Manual`);
+  if (state.exportOptions?.draftMode) {
+    lines.push(``);
+    lines.push(`> DRAFT / NOT VALIDATED: Warnings were present at export time. Review before use.`);
+  }
+  lines.push(``);
+  lines.push(`## Assumptions (auto-generated from this run)`);
+  lines.push(`- OpenShift version: ${version} (channel: ${channel})`);
+  lines.push(`- Platform: ${state.blueprint?.platform || "unknown"}`);
+  lines.push(`- Install method: ${state.methodology?.method || "unknown"}`);
+  lines.push(`- Connectivity scenario: ${connectivity}`);
+  lines.push(`- FIPS mode: ${state.globalStrategy?.fips ? "Enabled" : "Disabled"}`);
+  lines.push(`- Proxy: ${proxyEnabled}`);
+  if (state.globalStrategy?.proxyEnabled) {
+    lines.push(`- HTTP proxy: ${state.globalStrategy?.proxies?.httpProxy || "not set"}`);
+    lines.push(`- HTTPS proxy: ${state.globalStrategy?.proxies?.httpsProxy || "not set"}`);
+    lines.push(`- No proxy: ${state.globalStrategy?.proxies?.noProxy || "not set"}`);
+  }
+  lines.push(`- Mirror registry: ${mirrorRegistry} (private CA: ${mirrorPrivate})`);
+  lines.push(`- Trust bundle configured: ${trustStatus}`);
+  lines.push(`- NTP servers: ${ntpServers.length ? ntpServers.join(", ") : "Not configured"}`);
+  lines.push(`- Chosen catalogs: ${catalogs.length ? catalogs.join(", ") : "None"}`);
+  lines.push(`- Operator strategy: ${operatorList}`);
+  lines.push(``);
+  lines.push(`## Overview`);
+  lines.push(`This runbook is tailored to your selected platform, methodology, and release. It assumes a disconnected workflow with oc-mirror v2 and a user-managed mirror registry.`);
+  lines.push(``);
+  lines.push(`## [HIGH SIDE] Prerequisites and validation`);
+  lines.push(`Run these checks before starting the install. If DNS records do not exist yet (e.g. you will create them later), the installer may stop at 97–98% and wait; creating the records within the allowed time will allow it to complete.`);
+  lines.push(``);
+  lines.push(`1. DNS checks (verify resolution):`);
+  lines.push(`   - dig +short api.${clusterName}.${baseDomain}  # expect ${apiVip}`);
+  lines.push(`   - dig +short api-int.${clusterName}.${baseDomain}  # expect ${apiVip}`);
+  lines.push(`   - dig +short test.apps.${clusterName}.${baseDomain}  # expect ${ingressVip} (wildcard *.apps)`);
+  lines.push(`2. VIP reachability (bare metal; ensure load balancer or DNS points here):`);
+  lines.push(`   - ping -c3 ${apiVip}`);
+  lines.push(`   - ping -c3 ${ingressVip}`);
+  lines.push(`3. Time sync (all nodes and installer host must be in sync):`);
+  lines.push(`   - timedatectl status`);
+  lines.push(`   - chronyc sources -v`);
+  if (state.globalStrategy?.fips) {
+    lines.push(`4. FIPS prerequisites (FIPS is enabled for this run):`);
+    lines.push(`   - On each node that will join the cluster, run: fips-mode-setup --check`);
+    lines.push(`   - FIPS mode must be enabled before installation. See OpenShift docs for enabling FIPS on RHEL.`);
+  }
+  if (state.blueprint?.platform === "Bare Metal") {
+    lines.push(`${state.globalStrategy?.fips ? "5" : "4"}. Bare metal / DHCP (if using DHCP for node addressing):`);
+    lines.push(`   - Ensure DHCP reservations or static DHCP entries exist for each control plane and worker so hostnames and IPs are stable.`);
+  }
+  if (ntpServers.length) {
+    const ntpNum = state.globalStrategy?.fips ? (state.blueprint?.platform === "Bare Metal" ? "6" : "5") : (state.blueprint?.platform === "Bare Metal" ? "5" : "4");
+    lines.push(`${ntpNum}. Configure NTP (RHEL 9+):`);
+    lines.push(`   - sudo sed -i 's/^pool/#pool/' /etc/chrony.conf`);
+    ntpServers.forEach((server) => {
+      lines.push(`   - echo "server ${server} iburst" | sudo tee -a /etc/chrony.conf`);
+    });
+    lines.push(`   - sudo systemctl restart chronyd`);
+    lines.push(`   - Optional: apply generated MachineConfigs after install:`);
+    lines.push(`     - oc create -f 99-chrony-ntp-master.yaml`);
+    lines.push(`     - oc create -f 99-chrony-ntp-worker.yaml`);
+  }
+  lines.push(``);
+  if (proxyEnabled === "Enabled") {
+    lines.push(`## [LOW SIDE] Proxy environment (if required)`);
+    lines.push(`export http_proxy=${state.globalStrategy?.proxies?.httpProxy || ""}`);
+    lines.push(`export https_proxy=${state.globalStrategy?.proxies?.httpsProxy || ""}`);
+    lines.push(`export no_proxy=${state.globalStrategy?.proxies?.noProxy || ""}`);
+    lines.push(``);
+  }
+  lines.push(`## [LOW SIDE] Obtain tools and set credentials`);
+  lines.push(`1. Download oc, oc-mirror, and openshift-install for ${version}.`);
+  lines.push(`2. Verify checksums and place binaries on a host with access to upstream registries.`);
+  lines.push(`3. Confirm tool versions match the selected release: oc version --client; oc-mirror version; openshift-install version`);
+  lines.push(`4. Export your Red Hat pull secret:`);
+  lines.push(`   - export REGISTRY_AUTH_FILE=</path/to/pull-secret.json>`);
+  lines.push(``);
+  lines.push(`## [LOW SIDE] Create oc-mirror archive`);
+  lines.push(`1. Place ${imageSetName} in a working directory.`);
+  lines.push(`2. Run oc-mirror v2 (mirror-to-disk):`);
+  lines.push(`   - oc-mirror --config ${imageSetName} file://${outputPath} --v2`);
+  lines.push(`3. Create checksums for transfer:`);
+  lines.push(`   - cd ${outputPath} && find . -type f -maxdepth 2 -print0 | xargs -0 sha256sum > SHA256SUMS.txt`);
+  lines.push(``);
+  if (connectivity === "Disconnected with Jumpbox") {
+    lines.push(`## [JUMPBOX] Transfer and verify artifacts`);
+    lines.push(`1. Transfer ${outputPath} and SHA256SUMS.txt to the jumpbox.`);
+    lines.push(`2. Verify checksums:`);
+    lines.push(`   - (cd ${outputPath} && sha256sum -c SHA256SUMS.txt)`);
+    lines.push(`3. Transfer the archive and checksums to the high side.`);
+    lines.push(``);
+  } else {
+    lines.push(`## [LOW SIDE] Transfer across the air gap`);
+    lines.push(`1. Transfer ${outputPath} and SHA256SUMS.txt using approved media.`);
+    lines.push(`2. Verify checksums on the high side.`);
+    lines.push(``);
+  }
+  lines.push(`## [HIGH SIDE] Mirror registry`);
+  lines.push(`1. Install and run a local registry (mirror-registry or your approved registry procedure).`);
+  lines.push(`2. Ensure the registry DNS name matches: ${mirrorRegistry}`);
+  lines.push(`3. Ensure registry credentials are available to oc-mirror on the high side.`);
+  lines.push(``);
+  lines.push(`## [HIGH SIDE] oc-mirror v2 workflow`);
+  lines.push(`1. Push mirrored content into the registry (disk-to-mirror):`);
+  lines.push(`   - oc-mirror --config ${imageSetName} --from ${outputPath} docker://${mirrorRegistry} --v2`);
+  lines.push(`2. Apply the generated cluster-resources manifests after install:`);
+  lines.push(`   - oc apply -f ${outputPath}/cluster-resources`);
+  lines.push(``);
+  lines.push(`## [HIGH SIDE] Trust and certificates`);
+  if (trustBundle) {
+    lines.push(`1. Install the trust bundle on all hosts that access the registry/proxy:`);
+    lines.push(`   - sudo cp ca-bundle.pem /etc/pki/ca-trust/source/anchors/`);
+    lines.push(`   - sudo update-ca-trust`);
+  } else {
+    lines.push(`No additional trust bundle configured. Self-signed registries or intercepting proxies will fail unless trust is added.`);
+  }
+  lines.push(``);
+  lines.push(`## [HIGH SIDE] Installer workflow`);
+  lines.push(`1. Place install-config.yaml in ${installDir}.`);
+  if (state.methodology?.method === "Agent-Based Installer") {
+    lines.push(`2. Place agent-config.yaml in ${installDir}.`);
+    lines.push(`3. Create the agent ISO:`);
+    lines.push(`   - openshift-install agent create image --dir ${installDir}`);
+    lines.push(`4. Boot nodes from the ISO and monitor the cluster creation:`);
+    lines.push(`   - openshift-install agent wait-for install-complete --dir ${installDir}`);
+  } else {
+    lines.push(`2. Create the cluster (IPI/UPI):`);
+    lines.push(`   - openshift-install create cluster --dir ${installDir}`);
+    lines.push(`3. Monitor progress:`);
+    lines.push(`   - openshift-install wait-for install-complete --dir ${installDir}`);
+  }
+  lines.push(`4. Post-install sanity checks:`);
+  lines.push(`   - oc whoami`);
+  lines.push(`   - oc get nodes -o wide`);
+  lines.push(`   - oc get clusterversion`);
+  lines.push(`   - oc get co  # cluster operators; ensure critical ones are Available`);
+  lines.push(`   - oc get pods -A | head -20  # optional: spot-check pod status`);
+  lines.push(``);
+  if (state.blueprint?.platform === "Bare Metal") {
+    lines.push(`## [HIGH SIDE] Bare metal prerequisites`);
+    lines.push(`Ensure DNS, NTP, and DHCP (or static addressing) are configured for all nodes.`);
+    lines.push(`Validate MAC addresses, root device hints, and layer-2 reachability before booting agents.`);
+    if (state.methodology?.method === "IPI") {
+      lines.push(`For IPI bare metal, ensure BMC addresses and boot MACs are correct for each host.`);
+    }
+    lines.push(`Bare metal scenario mapping:`);
+    lines.push(`- IPI: set provisioningNetwork (Managed/Unmanaged/Disabled), BMCs, and boot MACs in install-config; use mirrored content for disconnected.`);
+    lines.push(`- UPI: provision nodes, DNS, and load balancers yourself; use agent-config or install-config as applicable.`);
+    lines.push(`- Agent-based: host inventory (NMState, root device), agent ISO; disconnected requires mirrored registry.`);
+  }
+  if (state.blueprint?.platform === "VMware vSphere") {
+    lines.push(`## [HIGH SIDE] vSphere prerequisites`);
+    lines.push(`Ensure vCenter connectivity, required permissions, and resource pools are prepared.`);
+    if (state.methodology?.method === "IPI") {
+      lines.push(`Confirm vCenter server, datacenter, cluster, datastore, and network values match the install-config.`);
+    }
+    lines.push(`vSphere scenario mapping:`);
+    lines.push(`- IPI: vCenter, datacenter, cluster, datastore, network (and optional folder/resourcePool); disconnected uses mirrored content.`);
+    lines.push(`- UPI: provision VMs and infrastructure yourself; follow platform-agnostic UPI and vSphere UPI docs.`);
+  }
+  if (state.blueprint?.platform === "Nutanix") {
+    lines.push(`## [HIGH SIDE] Nutanix prerequisites`);
+    lines.push(`Ensure Prism Central access, subnet configuration, and required image storage are available.`);
+    if (state.methodology?.method === "IPI") {
+      lines.push(`Confirm Prism Central endpoint, credentials, and subnet UUIDs are correct.`);
+    }
+    lines.push(`Nutanix scenario mapping:`);
+    lines.push(`- IPI: Prism Central endpoint, subnet UUID(s), cluster name; disconnected install uses mirrored content.`);
+    lines.push(`- Review Nutanix install-config parameters and disconnected installation docs for your version.`);
+  }
+  if (state.blueprint?.platform === "AWS GovCloud") {
+    lines.push(`## [HIGH SIDE] AWS GovCloud prerequisites`);
+    lines.push(`Validate IAM roles, VPC networking, and service endpoints for restricted access.`);
+    if (state.methodology?.method === "IPI") {
+      lines.push(`Confirm AWS region, hosted zone, and load balancer settings in the install-config.`);
+      if (platformConfig.aws?.controlPlaneInstanceType || platformConfig.aws?.workerInstanceType) {
+        lines.push(`Confirm control plane and worker instance types align with capacity requirements.`);
+      }
+      if (platformConfig.aws?.amiId) {
+        lines.push(`A custom RHCOS AMI ID is set; verify it matches the selected OpenShift version and region.`);
+      } else {
+        lines.push(`If installing in a secret region, specify a custom RHCOS AMI ID before installation.`);
+      }
+    }
+    lines.push(`AWS scenario mapping:`);
+    lines.push(`- Existing VPC: provide target subnets (platform.aws.subnets).`);
+    lines.push(`- Private cluster: set publish=Internal and ensure private DNS for api/apps.`);
+    lines.push(`- Government/secret region: set a custom RHCOS AMI ID (platform.aws.amiID).`);
+    lines.push(`- No Route 53: leave hostedZone empty and manage DNS records manually.`);
+    lines.push(`- Restricted network: use mirrored content, a reachable registry, and the disconnected workflow.`);
+  }
+  if (state.blueprint?.platform === "Azure Government") {
+    lines.push(`## [HIGH SIDE] Azure Government prerequisites`);
+    lines.push(`Validate the subscription, service principals, and network policies for Government clouds.`);
+    if (state.methodology?.method === "IPI") {
+      lines.push(`Confirm cloudName, region, and resource group names in the install-config.`);
+    }
+    lines.push(`Azure Government scenario mapping:`);
+    lines.push(`- IPI: cloudName (e.g. AzureUSGovernmentCloud), region, resourceGroupName, baseDomainResourceGroupName; publish/credentialsMode for private.`);
+    lines.push(`- UPI: provision VMs and networking yourself; use Azure install-config parameters for platform.azure.`);
+    lines.push(`- Restricted network: use mirrored content and a reachable registry; follow disconnected workflow.`);
+  }
+  if (state.methodology?.method === "Agent-Based Installer") {
+    lines.push(``);
+    lines.push(`## [HIGH SIDE] Agent-based installer guidance`);
+    lines.push(`Use the generated agent-config.yaml and ensure NMState matches your host networking.`);
+  }
+  if (state.methodology?.method === "UPI") {
+    lines.push(``);
+    lines.push(`## [HIGH SIDE] UPI guidance`);
+    lines.push(`Provision infrastructure, DNS, and load balancers before running the installer.`);
+  }
+  lines.push(``);
+  lines.push(`## Relevant Official Documentation`);
+  if (!docsLinks || docsLinks.length === 0) {
+    lines.push(`- Documentation links could not be validated. Use the "Update Docs Links" action to refresh.`);
+  } else {
+    const unverified = docsLinks.filter((link) => link.validated === false);
+    if (unverified.length) {
+      lines.push(`- Some links could not be validated automatically. Please verify before use.`);
+    }
+    docsLinks.forEach((link) => {
+      const suffix = link.validated === false ? " (unverified)" : "";
+      lines.push(`- [${link.label}](${link.url})${suffix}`);
+    });
+  }
+  lines.push(``);
+  return lines.join("\n");
+};
+
+export { buildInstallConfig, buildAgentConfig, buildImageSetConfig, buildFieldManual, buildNtpMachineConfigs };

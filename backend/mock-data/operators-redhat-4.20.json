@@ -1,0 +1,7 @@
+{
+  "results": [
+    { "id": "redhat:kubevirt-hyperconverged", "name": "kubevirt-hyperconverged", "displayName": "OpenShift Virtualization", "defaultChannel": "stable", "catalog": "redhat" },
+    { "id": "redhat:openshift-gitops-operator", "name": "openshift-gitops-operator", "displayName": "OpenShift GitOps", "defaultChannel": "stable", "catalog": "redhat" },
+    { "id": "redhat:lvms-operator", "name": "lvms-operator", "displayName": "LVM Storage", "defaultChannel": "stable", "catalog": "redhat" }
+  ]
+}

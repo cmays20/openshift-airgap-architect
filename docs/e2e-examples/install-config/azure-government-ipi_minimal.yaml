@@ -1,0 +1,40 @@
+# Synthetic from params — no full-file example in 4.20 docs for Azure Government IPI.
+# Structure from data/params/4.20/azure-government-ipi.json and docs-index installing-azure-government-ipi.
+# Sources: https://docs.openshift.com/container-platform/4.20/installing/installing_azure_government/installing-azure-government-ipi.html
+apiVersion: v1
+baseDomain: example.com
+metadata:
+  name: airgap-cluster
+compute:
+  - name: worker
+    replicas: 0
+    architecture: amd64
+controlPlane:
+  name: master
+  replicas: 3
+  architecture: amd64
+networking:
+  networkType: OVNKubernetes
+  machineNetwork:
+    - cidr: 10.90.0.0/24
+  clusterNetwork:
+    - cidr: 10.128.0.0/14
+      hostPrefix: 23
+  serviceNetwork:
+    - 172.30.0.0/16
+platform:
+  azure:
+    cloudName: AzureUSGovernmentCloud
+    region: usgovvirginia
+    resourceGroupName: rg-example
+    baseDomainResourceGroupName: rg-dns
+pullSecret: '{"auths":{}}'
+sshKey: ''
+imageDigestSources:
+  - source: quay.io/openshift-release-dev/ocp-release
+    mirrors:
+      - registry.local:5000/ocp-release
+  - source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
+    mirrors:
+      - registry.local:5000/ocp-v4.0-art-dev
+publish: External

@@ -1,0 +1,39 @@
+{
+  "version": "1",
+  "description": "Data-driven questions for Install method step (Help me choose). source_type: doc | heuristic; doc requires citation.",
+  "questions": [
+    {
+      "id": "q-automation",
+      "prompt": "Do you need full automation (installer provisions infrastructure) or will you provision machines yourself?",
+      "applicablePlatforms": ["*"],
+      "applicableFamilies": ["Agent-based", "IPI", "UPI"],
+      "answerOptions": [
+        { "value": "full-auto", "label": "Full automation (installer provisions)" },
+        { "value": "self-provision", "label": "I will provision machines myself" }
+      ],
+      "source_type": "heuristic",
+      "citation": null,
+      "impactRules": [
+        { "when": "full-auto", "recommendWeights": { "IPI": 1 } },
+        { "when": "self-provision", "recommendWeights": { "Agent-Based Installer": 0.5, "UPI": 0.5 } }
+      ]
+    },
+    {
+      "id": "q-baremetal-type",
+      "prompt": "For Bare Metal: do you have a provisioning network (DHCP/PXE) or will you use the agent-based flow with pre-installed RHCOS?",
+      "applicablePlatforms": ["Bare Metal"],
+      "applicableFamilies": ["Agent-based", "IPI", "UPI"],
+      "answerOptions": [
+        { "value": "provisioning-network", "label": "I have a provisioning network (DHCP/PXE)" },
+        { "value": "agent-preinstalled", "label": "I will use agent with pre-installed RHCOS" }
+      ],
+      "source_type": "heuristic",
+      "citation": null,
+      "impactRules": [
+        { "when": "provisioning-network", "recommendWeights": { "IPI": 0.5, "UPI": 0.5 } },
+        { "when": "agent-preinstalled", "recommendWeights": { "Agent-Based Installer": 1 } }
+      ]
+    }
+  ],
+  "disclaimerHeuristic": "Recommendations marked as heuristic are not directly cited from documentation and may be updated after review."
+}

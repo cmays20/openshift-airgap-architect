@@ -1,0 +1,1078 @@
+/**
+ * Main app: landing, Blueprint, Methodology, then either legacy (Global Strategy, Host Inventory) or segmented flow
+ * (Identity & Access, Networking, Connectivity & Mirroring, Trust & Proxy, Platform Specifics, Hosts/Inventory). Step list from visibleSteps; COMPONENT_MAP maps stepId to component.
+ */
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { AppProvider, useApp } from "./store.jsx";
+import Sidebar from "./components/Sidebar.jsx";
+import LandingPage from "./LandingPage.jsx";
+import BlueprintStep from "./steps/BlueprintStep.jsx";
+import PlaceholderCard from "./components/PlaceholderCard.jsx";
+import MethodologyStep from "./steps/MethodologyStep.jsx";
+import HostInventoryStep from "./steps/HostInventoryStep.jsx";
+import HostInventoryV2Step from "./steps/HostInventoryV2Step.jsx";
+import GlobalStrategyStep from "./steps/GlobalStrategyStep.jsx";
+import OperatorsStep from "./steps/OperatorsStep.jsx";
+import ReviewStep from "./steps/ReviewStep.jsx";
+import RunOcMirrorStep from "./steps/RunOcMirrorStep.jsx";
+import OperationsStep from "./steps/OperationsStep.jsx";
+import IdentityAccessStep from "./steps/IdentityAccessStep.jsx";
+import NetworkingV2Step from "./steps/NetworkingV2Step.jsx";
+import ConnectivityMirroringStep from "./steps/ConnectivityMirroringStep.jsx";
+import TrustProxyStep from "./steps/TrustProxyStep.jsx";
+import PlatformSpecificsStep from "./steps/PlatformSpecificsStep.jsx";
+import HostsInventorySegmentStep from "./steps/HostsInventorySegmentStep.jsx";
+import ScenarioHeaderPanel from "./components/ScenarioHeaderPanel.jsx";
+import ToolsDrawer from "./components/ToolsDrawer.jsx";
+import { validateStep, validateBlueprintPullSecretOptional } from "./validation.js";
+import { getScenarioId } from "./catalogResolver.js";
+import { SCENARIO_IDS_WITH_HOST_INVENTORY } from "./hostInventoryV2Helpers.js";
+import { apiFetch } from "./api.js";
+import { logAction } from "./logger.js";
+
+const COMPONENT_MAP = {
+  "blueprint": BlueprintStep,
+  "install-method": MethodologyStep,
+  methodology: MethodologyStep,
+  "cluster-identity": () => <PlaceholderCard title="Cluster identity" />,
+  inventory: HostInventoryStep,
+  "inventory-v2": HostInventoryV2Step,
+  networking: GlobalStrategyStep,
+  global: GlobalStrategyStep,
+  "disconnected-proxy": () => <PlaceholderCard title="Disconnected and proxy" />,
+  operators: OperatorsStep,
+  "review-generate": ReviewStep,
+  review: ReviewStep,
+  "run-oc-mirror": RunOcMirrorStep,
+  operations: OperationsStep,
+  "identity-access": IdentityAccessStep,
+  "networking-v2": NetworkingV2Step,
+  "connectivity-mirroring": ConnectivityMirroringStep,
+  "trust-proxy": TrustProxyStep,
+  "platform-specifics": PlatformSpecificsStep,
+  "hosts-inventory": HostsInventorySegmentStep
+};
+
+const FALLBACK_WIZARD_STEPS = [
+  { stepNumber: 1, id: "blueprint", label: "Blueprint", subSteps: [], component: BlueprintStep },
+  { stepNumber: 2, id: "methodology", label: "Methodology", subSteps: [], component: MethodologyStep },
+  { stepNumber: 3, id: "global", label: "Global Strategy", subSteps: [{ id: "network-wide", label: "Network-wide" }, { id: "vips-ingress", label: "VIPs and ingress" }, { id: "dhcp-static", label: "DHCP vs Static plan" }, { id: "advanced-networking", label: "Advanced networking", collapsedByDefault: true }], component: GlobalStrategyStep },
+  { stepNumber: 4, id: "inventory", label: "Host Inventory", subSteps: [], component: HostInventoryStep },
+  { stepNumber: 5, id: "operators", label: "Operators", subSteps: [], component: OperatorsStep },
+  { stepNumber: 6, id: "review", label: "Assets & Guide", subSteps: [], component: ReviewStep },
+  { stepNumber: 7, id: "run-oc-mirror", label: "Run oc-mirror", subSteps: [], component: RunOcMirrorStep },
+  { stepNumber: 8, id: "operations", label: "Operations", subSteps: [], component: OperationsStep }
+];
+
+/** Six replacement steps for segmented flow (hallway). Step numbers assigned when building visibleSteps. */
+const SEGMENTED_REPLACEMENT_STEP_DEFS = [
+  { id: "identity-access", label: "Identity & Access", component: IdentityAccessStep },
+  { id: "networking-v2", label: "Networking", component: NetworkingV2Step },
+  { id: "connectivity-mirroring", label: "Connectivity & Mirroring", component: ConnectivityMirroringStep },
+  { id: "trust-proxy", label: "Trust & Proxy", component: TrustProxyStep },
+  { id: "platform-specifics", label: "Platform Specifics", component: PlatformSpecificsStep },
+  { id: "hosts-inventory", label: "Hosts / Inventory", component: HostsInventorySegmentStep }
+];
+
+/** Maps OLD step ids (from pre–stepMap flow) to NEW step ids. "start" is Step 0 and is never legacy. */
+const LEGACY_STEP_ID_MAP = {
+  "core-lock-in": "blueprint",
+  blueprint: "blueprint",
+  release: "blueprint",
+  "install-method": "methodology",
+  methodology: "methodology",
+  "cluster-identity": "global",
+  global: "global",
+  networking: "global",
+  inventory: "inventory",
+  "inventory-v2": "inventory-v2",
+  operators: "operators",
+  "review-generate": "review",
+  review: "review",
+  "run-oc-mirror": "run-oc-mirror",
+  operations: "operations",
+  "identity-access": "identity-access",
+  "networking-v2": "networking-v2",
+  "connectivity-mirroring": "connectivity-mirroring",
+  "trust-proxy": "trust-proxy",
+  "platform-specifics": "platform-specifics",
+  "hosts-inventory": "hosts-inventory"
+};
+
+function buildWizardSteps(stepMap) {
+  if (!stepMap?.mvpSteps?.length) return FALLBACK_WIZARD_STEPS;
+  const wizard = stepMap.mvpSteps
+    .filter((s) => s.stepNumber >= 1)
+    .map((s) => ({
+      stepNumber: s.stepNumber,
+      id: s.id,
+      label: s.label,
+      subSteps: s.subSteps || [],
+      component: COMPONENT_MAP[s.id] || (() => <PlaceholderCard title={s.label} />)
+    }));
+  return wizard.length ? wizard : FALLBACK_WIZARD_STEPS;
+}
+
+/** Error boundary with optional fallback message and refresh. Never logs or exposes secrets. */
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  render() {
+    if (this.state.error) {
+      const message = this.props.fallbackMessage ?? "Something went wrong; refresh or go back.";
+      return (
+        <div className="app-loading" role="alert">
+          <div>
+            <h3>{message}</h3>
+            {this.props.showRefresh !== false ? (
+              <button type="button" className="primary" onClick={() => window.location.reload()}>
+                Refresh page
+              </button>
+            ) : null}
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+const AppShell = () => {
+  const { state, loading, startOver, updateState, setState } = useApp();
+  const [active, setActive] = useState(0);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [showReleaseWarning, setShowReleaseWarning] = useState(false);
+  const [showBlueprintWarning, setShowBlueprintWarning] = useState(false);
+  const [showCoreLockWarning, setShowCoreLockWarning] = useState(false);
+  const [lockAndProceedLoading, setLockAndProceedLoading] = useState(false);
+  const [showStartOverConfirm, setShowStartOverConfirm] = useState(false);
+  const [resetting, setResetting] = useState(false);
+  const [showSwitchFlowConfirm, setShowSwitchFlowConfirm] = useState(false);
+  const [pendingSwitchFlow, setPendingSwitchFlow] = useState(null);
+  const [validationModal, setValidationModal] = useState(null);
+  const [highlightErrors, setHighlightErrors] = useState(false);
+  const [pendingNavIndex, setPendingNavIndex] = useState(null);
+  const [theme, setTheme] = useState(() => localStorage.getItem("airgap-theme") || "light");
+  const [showPreview, setShowPreview] = useState(false);
+  const [previewFiles, setPreviewFiles] = useState({});
+  const [previewError, setPreviewError] = useState("");
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [confirmingRelease, setConfirmingRelease] = useState(false);
+  const [showLanding, setShowLanding] = useState(true);
+  const [showStartOverModal, setShowStartOverModal] = useState(false);
+  const [stepMap, setStepMap] = useState(null);
+  const [blockedMessage, setBlockedMessage] = useState("");
+  const [runActionsOpen, setRunActionsOpen] = useState(false);
+  const [prefsOpen, setPrefsOpen] = useState(false);
+  const [jobsCount, setJobsCount] = useState(0);
+  const [isToolsOpen, setIsToolsOpen] = useState(false);
+  const [lockToast, setLockToast] = useState("");
+  const importRef = useRef(null);
+  const runActionsRef = useRef(null);
+  const prefsRef = useRef(null);
+
+  useEffect(() => {
+    apiFetch("/api/schema/stepMap")
+      .then((data) => setStepMap(data))
+      .catch(() => setStepMap({}));
+  }, []);
+
+  // Operations (N) badge: poll job count when in wizard so header and sidebar can show count (§9.3 placement)
+  useEffect(() => {
+    if (showLanding) return;
+    const load = () => apiFetch("/api/jobs/count").then((d) => setJobsCount(d.count ?? 0)).catch(() => setJobsCount(0));
+    load();
+    const interval = setInterval(load, 15000);
+    return () => clearInterval(interval);
+  }, [showLanding]);
+
+  const showHostInventory = useMemo(
+    () =>
+      state?.blueprint?.platform === "Bare Metal" &&
+      (state?.methodology?.method === "Agent-Based Installer" || state?.methodology?.method === "IPI"),
+    [state?.blueprint?.platform, state?.methodology?.method]
+  );
+  const hostInventoryV2Enabled = state?.ui?.hostInventoryV2 === true;
+  const segmentedFlowV1 = state?.ui?.segmentedFlowV1 === true;
+  const visibleSteps = useMemo(() => {
+    if (segmentedFlowV1) {
+      const base = buildWizardSteps(stepMap);
+      const blueprintStep = base.find((s) => s.id === "blueprint");
+      const methodologyStep = base.find((s) => s.id === "methodology");
+      const operatorsStep = base.find((s) => s.id === "operators");
+      const reviewStep = base.find((s) => s.id === "review");
+      const runOcMirrorStep = base.find((s) => s.id === "run-oc-mirror");
+      const operationsStep = base.find((s) => s.id === "operations");
+      const scenarioId = getScenarioId(state);
+      const showHostsStep =
+        scenarioId && SCENARIO_IDS_WITH_HOST_INVENTORY.includes(scenarioId);
+      const replacementDefs = SEGMENTED_REPLACEMENT_STEP_DEFS.filter(
+        (def) => def.id !== "hosts-inventory" || showHostsStep
+      );
+      const replacementSteps = replacementDefs.map((def, i) => ({
+        stepNumber: 3 + i,
+        id: def.id,
+        label: def.label,
+        subSteps: [],
+        component: COMPONENT_MAP[def.id]
+      }));
+      const steps = [
+        blueprintStep || FALLBACK_WIZARD_STEPS[0],
+        methodologyStep || FALLBACK_WIZARD_STEPS[1],
+        ...replacementSteps,
+        operatorsStep || FALLBACK_WIZARD_STEPS[4],
+        reviewStep || FALLBACK_WIZARD_STEPS[5],
+        runOcMirrorStep || FALLBACK_WIZARD_STEPS[6],
+        operationsStep || FALLBACK_WIZARD_STEPS[7]
+      ];
+      return steps.map((s, i) => ({ ...s, stepNumber: i + 1 }));
+    }
+    const steps = buildWizardSteps(stepMap);
+    let visible = showHostInventory ? steps : steps.filter((s) => s.id !== "inventory");
+    if (showHostInventory && hostInventoryV2Enabled) {
+      const invIdx = visible.findIndex((s) => s.id === "inventory");
+      const v2Step = {
+        stepNumber: (invIdx >= 0 ? invIdx + 2 : visible.length + 1),
+        id: "inventory-v2",
+        label: "Hosts (New)",
+        subSteps: [],
+        component: COMPONENT_MAP["inventory-v2"]
+      };
+      visible = invIdx >= 0
+        ? [...visible.slice(0, invIdx + 1), v2Step, ...visible.slice(invIdx + 1)]
+        : [...visible, v2Step];
+    }
+    return visible.map((s, i) => ({ ...s, stepNumber: i + 1 }));
+  }, [state, stepMap, showHostInventory, hostInventoryV2Enabled, segmentedFlowV1]);
+
+  const foundationalLocked = Boolean(
+    state?.blueprint?.confirmed && (state?.version?.versionConfirmed ?? state?.release?.confirmed)
+  );
+
+  const sidebarSteps = useMemo(
+    () => visibleSteps.filter((s) => s.id !== "operations"),
+    [visibleSteps]
+  );
+  const Current = visibleSteps[active]?.component || visibleSteps[0]?.component;
+  const activeStepId = visibleSteps[active]?.id;
+  const activeStepValidation = useMemo(
+    () => (activeStepId && state ? validateStep(state, activeStepId) : {}),
+    [state, activeStepId]
+  );
+  const fieldErrors = activeStepValidation?.fieldErrors || {};
+  // Deliverable gating (Workstream D): list of step labels that have errors (for "Complete at least: …" on Review).
+  const incompleteStepLabels = useMemo(() => {
+    if (!state) return [];
+    const reviewIdx = visibleSteps.findIndex((s) => s.id === "review");
+    if (reviewIdx <= 0) return [];
+    const stepsBeforeReview = visibleSteps.slice(0, reviewIdx);
+    return stepsBeforeReview
+      .filter((step) => (validateStep(state, step.id).errors || []).length > 0)
+      .map((step) => step.label);
+  }, [state, visibleSteps]);
+
+  const versionConfirmed = state?.version?.versionConfirmed ?? state?.release?.confirmed;
+  const versionDependentSteps = useMemo(() => new Set(["blueprint", "global", "review"]), []);
+  const blueprintReady = Boolean(state?.blueprint?.arch && state?.blueprint?.platform);
+  const releaseReady = Boolean(state?.release?.channel && state?.release?.patchVersion);
+
+  const errorFlags = useMemo(() => {
+    if (!state) return {};
+    const flags = {};
+    visibleSteps.forEach((step) => {
+      const result = validateStep(state, step.id);
+      flags[step.id] = (result.errors || []).length > 0;
+    });
+    return flags;
+  }, [state, visibleSteps]);
+
+  const blueprintPullSecretBlocking = useMemo(() => {
+    const ephemeral = (state?.blueprint?.blueprintPullSecretEphemeral || "").trim();
+    if (!ephemeral) return false;
+    return !validateBlueprintPullSecretOptional(ephemeral).valid;
+  }, [state?.blueprint?.blueprintPullSecretEphemeral]);
+
+  // Checkmarks only after Proceed is clicked with no validation errors. Visiting a tab never adds a checkmark; skip or "proceed anyway" → needs review.
+  const completeFlags = useMemo(() => {
+    if (!state) return {};
+    const flags = {};
+    visibleSteps.forEach((step) => {
+      const result = validateStep(state, step.id);
+      const valid = (result.errors || []).length === 0;
+      const versionOk = versionDependentSteps.has(step.id) ? Boolean(versionConfirmed) : true;
+      const needsReview = Boolean(state.reviewFlags?.[step.id]);
+      const explicitlyCompleted = Boolean(state.ui?.completedSteps?.[step.id]);
+      const completed =
+        step.id === "blueprint"
+          ? Boolean(state.blueprint?.confirmed && (state?.version?.versionConfirmed ?? state?.release?.confirmed))
+          : valid && explicitlyCompleted && !needsReview && versionOk;
+      flags[step.id] = completed;
+    });
+    return flags;
+  }, [state, visibleSteps, versionConfirmed, versionDependentSteps]);
+
+  const canProceed = useMemo(() => true, []);
+
+  // Install progress: any visited or completed step (reuses existing state, no new system).
+  const hasProgress = useMemo(() => {
+    const visited = state?.ui?.visitedSteps && Object.keys(state.ui.visitedSteps).length > 0;
+    const completed = state?.ui?.completedSteps && Object.keys(state.ui.completedSteps).length > 0;
+    return Boolean(visited || completed);
+  }, [state?.ui?.visitedSteps, state?.ui?.completedSteps]);
+
+  // First incomplete step for resume: earliest step not in completedSteps (so we don't skip Methodology when only Blueprint is done).
+  const firstIncompleteStepIndex = useMemo(() => {
+    const idx = visibleSteps.findIndex((step) => {
+      if (step.id === "blueprint") {
+        return !(state?.blueprint?.confirmed && (state?.version?.versionConfirmed ?? state?.release?.confirmed));
+      }
+      return !state?.ui?.completedSteps?.[step.id];
+    });
+    return idx >= 0 ? idx : Math.max(0, visibleSteps.length - 1);
+  }, [visibleSteps, state?.ui?.completedSteps, state?.blueprint?.confirmed, state?.version?.versionConfirmed, state?.release?.confirmed]);
+
+  const previewStepId = visibleSteps[active]?.id;
+  const previewTarget = useMemo(() => {
+    if (previewStepId === "review") return "install-config.yaml";
+    if (previewStepId === "global") return "install-config.yaml";
+    return "install-config.yaml";
+  }, [previewStepId]);
+  const previewEnabled = useMemo(() => ["global", "review"].includes(previewStepId), [previewStepId]);
+  const extraPreviewFiles = useMemo(() => {
+    if (!previewFiles) return [];
+    return Object.entries(previewFiles).filter(([name]) => name.startsWith("99-chrony-ntp-"));
+  }, [previewFiles]);
+
+  useEffect(() => {
+    if (!previewEnabled && showPreview) {
+      setShowPreview(false);
+    }
+  }, [previewEnabled, showPreview]);
+
+  useEffect(() => {
+    if (active >= visibleSteps.length) {
+      setActive(Math.max(0, visibleSteps.length - 1));
+    }
+  }, [visibleSteps.length, active]);
+
+  // Route guard: before lock, only Blueprint is allowed. Redirect any other route to Blueprint.
+  useEffect(() => {
+    if (showLanding || !state?.ui) return;
+    if (foundationalLocked) return;
+    const blueprintIndex = visibleSteps.findIndex((s) => s.id === "blueprint");
+    if (blueprintIndex < 0) return;
+    if (active !== blueprintIndex) {
+      setActive(blueprintIndex);
+      updateState({ ui: { ...state.ui, activeStepId: "blueprint" } });
+      setLockToast("Lock your foundational selections to continue.");
+      const t = setTimeout(() => setLockToast(""), 4000);
+      return () => clearTimeout(t);
+    }
+  }, [showLanding, state, foundationalLocked, active, visibleSteps, updateState]);
+
+  // Required-field highlighting (Workstream D): when landing on a step with errors, show highlights.
+  useEffect(() => {
+    const stepId = visibleSteps[active]?.id;
+    if (!stepId || !state) return;
+    const result = validateStep(state, stepId);
+    const hasErrors = (result.errors || []).length > 0;
+    if (hasErrors) setHighlightErrors(true);
+  }, [active, visibleSteps, state]);
+
+  // Sync active step index from persisted activeStepId only once when state first loads (e.g. from API), so we land on the correct step without undoing user navigation.
+  const hasSyncedActiveFromState = useRef(false);
+  useEffect(() => {
+    if (!state?.ui?.activeStepId || !visibleSteps.length) return;
+    if (hasSyncedActiveFromState.current) return;
+    const currentStepId = visibleSteps[active]?.id;
+    if (state.ui.activeStepId === currentStepId) {
+      hasSyncedActiveFromState.current = true;
+      return;
+    }
+    const idx = visibleSteps.findIndex((s) => s.id === state.ui.activeStepId);
+    if (idx >= 0) {
+      setActive(idx);
+      hasSyncedActiveFromState.current = true;
+    }
+  }, [state?.ui?.activeStepId, visibleSteps, active]);
+
+  useEffect(() => {
+    if (!state?.ui) return;
+    if (!showHostInventory && state.ui.activeStepId === "inventory") {
+      const currentId = visibleSteps[active]?.id || "global";
+      updateState({ ui: { ...state.ui, activeStepId: currentId } });
+    }
+  }, [showHostInventory, state?.ui?.activeStepId, visibleSteps, active, updateState, state?.ui]);
+
+  // Segmented flow: when user was on Hosts and methodology no longer has host inventory, move to step at current index (e.g. Operators).
+  useEffect(() => {
+    if (!state?.ui || !segmentedFlowV1) return;
+    const hasHostsStep = visibleSteps.some((s) => s.id === "hosts-inventory");
+    if (hasHostsStep || state.ui.activeStepId !== "hosts-inventory") return;
+    const fallbackId = visibleSteps[active]?.id ?? "operators";
+    updateState({ ui: { ...state.ui, activeStepId: fallbackId } });
+  }, [segmentedFlowV1, state?.ui?.activeStepId, visibleSteps, active, updateState, state?.ui]);
+
+  useEffect(() => {
+    if (!state?.ui) return;
+    if (showLanding) return;
+    const currentStepId = visibleSteps[active]?.id;
+    if (!currentStepId) return;
+    const visitedSteps = { ...(state.ui.visitedSteps || {}) };
+    if (!visitedSteps[currentStepId]) {
+      visitedSteps[currentStepId] = true;
+      updateState({ ui: { ...state.ui, visitedSteps } });
+    }
+  }, [active, visibleSteps, state?.ui, showLanding, updateState]);
+
+  useEffect(() => {
+    document.body.dataset.theme = theme;
+    localStorage.setItem("airgap-theme", theme);
+  }, [theme]);
+
+  useEffect(() => {
+    const close = (e) => {
+      if (runActionsRef.current && !runActionsRef.current.contains(e.target)) setRunActionsOpen(false);
+      if (prefsRef.current && !prefsRef.current.contains(e.target)) setPrefsOpen(false);
+    };
+    document.addEventListener("click", close);
+    return () => document.removeEventListener("click", close);
+  }, []);
+
+  useEffect(() => {
+    if (!showPreview) return;
+    const confirmed = state?.version?.versionConfirmed ?? state?.release?.confirmed;
+    if (!confirmed) {
+      setPreviewError("Confirm the release version to generate YAML previews.");
+      setPreviewFiles({});
+      return;
+    }
+    setPreviewError("");
+    setPreviewLoading(true);
+    const timeout = setTimeout(() => {
+      apiFetch("/api/generate")
+        .then((data) => {
+          logAction("generate_preview", { stepId: previewStepId });
+          setPreviewFiles(data.files || {});
+        })
+        .catch((error) => setPreviewError(String(error?.message || error)))
+        .finally(() => setPreviewLoading(false));
+    }, 500);
+    return () => clearTimeout(timeout);
+  }, [
+    showPreview,
+    previewStepId,
+    state?.release?.patchVersion,
+    state?.blueprint,
+    state?.methodology,
+    state?.globalStrategy,
+    state?.hostInventory,
+    state?.operators?.selected?.length,
+    state?.credentials,
+    state?.trust,
+    state?.platformConfig
+  ]);
+
+  const setActiveStep = (nextIndex, options = {}) => {
+    const index = Math.max(0, Math.min(nextIndex, visibleSteps.length - 1));
+    const prevStepId = visibleSteps[active]?.id;
+    const nextStepId = visibleSteps[index]?.id;
+    const visitedSteps = { ...(state.ui?.visitedSteps || {}) };
+    const completedSteps = { ...(state.ui?.completedSteps || {}) };
+    if (prevStepId) visitedSteps[prevStepId] = true;
+    if (nextStepId) visitedSteps[nextStepId] = true;
+    if (options.markComplete && prevStepId === options.markComplete) {
+      completedSteps[prevStepId] = true;
+    }
+
+    const nextReviewFlags = { ...(state.reviewFlags || {}) };
+    if (prevStepId && prevStepId !== nextStepId) {
+      if (options.skipReviewForStep && prevStepId === options.skipReviewForStep) {
+        nextReviewFlags[prevStepId] = false;
+      } else {
+        const validation = validateStep(state, prevStepId);
+        if (validation.errors?.length) {
+          nextReviewFlags[prevStepId] = true;
+        } else if (nextReviewFlags[prevStepId]) {
+          nextReviewFlags[prevStepId] = false;
+        }
+      }
+    }
+
+    setActive(index);
+    if (pendingNavIndex !== null) {
+      setPendingNavIndex(null);
+    }
+    if (prevStepId !== nextStepId) {
+      logAction("step_change", { fromStepId: prevStepId, toStepId: nextStepId });
+    }
+    if (nextStepId && state.ui?.activeStepId !== nextStepId) {
+      updateState({
+        ui: {
+          ...state.ui,
+          activeStepId: nextStepId,
+          visitedSteps,
+          completedSteps
+        },
+        reviewFlags: nextReviewFlags
+      });
+    } else if (JSON.stringify(nextReviewFlags) !== JSON.stringify(state.reviewFlags || {})) {
+      updateState({
+        reviewFlags: nextReviewFlags,
+        ui: { ...state.ui, visitedSteps, completedSteps }
+      });
+    }
+  };
+
+  const advance = () => setActiveStep(active + 1);
+
+  const attemptNavigate = (nextIndex) => {
+    const index = Math.max(0, Math.min(nextIndex, visibleSteps.length - 1));
+    const targetStepId = visibleSteps[index]?.id;
+    const blueprintIndex = visibleSteps.findIndex((s) => s.id === "blueprint");
+
+    if (!foundationalLocked) {
+      if (targetStepId !== "blueprint") {
+        setLockToast("Lock your foundational selections to continue.");
+        setTimeout(() => setLockToast(""), 4000);
+        if (active !== blueprintIndex) setActive(blueprintIndex);
+        return;
+      }
+      setLockToast("");
+    }
+
+    if (index <= active) {
+      setActiveStep(index);
+      return;
+    }
+    const currentStep = visibleSteps[active]?.id;
+    if (currentStep === "blueprint" && !foundationalLocked) {
+      setPendingNavIndex(index);
+      setShowCoreLockWarning(true);
+      return;
+    }
+    const result = validateStep(state, currentStep);
+    const hasErrors = result.errors?.length > 0;
+    if (hasErrors) setHighlightErrors(true);
+    setActiveStep(index, !hasErrors && currentStep ? { markComplete: currentStep } : {});
+  };
+  const proceed = () => attemptNavigate(active + 1);
+  const back = () => {
+    if (active === 0) {
+      setShowLanding(true);
+    } else {
+      setActiveStep(active - 1);
+    }
+  };
+  const confirmBlueprintAndProceed = () => {
+    if (!blueprintReady) return;
+    setShowBlueprintWarning(false);
+    setHighlightErrors(false);
+    updateState({
+      blueprint: {
+        ...state.blueprint,
+        confirmed: true,
+        confirmationTimestamp: Date.now()
+      },
+      reviewFlags: { ...(state.reviewFlags || {}), blueprint: false }
+    });
+    const target = pendingNavIndex ?? active;
+    setPendingNavIndex(null);
+    setActiveStep(target, { skipReviewForStep: "blueprint" });
+  };
+
+  const confirmReleaseAndProceed = async () => {
+    if (!releaseReady || confirmingRelease) return;
+    setConfirmingRelease(true);
+    try {
+      const data = await apiFetch("/api/operators/confirm", { method: "POST" });
+      setHighlightErrors(false);
+      updateState({
+        release: { ...state.release, confirmed: true },
+        version: data.version,
+        reviewFlags: { ...(state.reviewFlags || {}), release: false }
+      });
+      setShowReleaseWarning(false);
+      const target = pendingNavIndex ?? active + 1;
+      setPendingNavIndex(null);
+      setActiveStep(target, { skipReviewForStep: "blueprint", markComplete: "blueprint" });
+    } finally {
+      setConfirmingRelease(false);
+    }
+  };
+  const handleInstallClick = () => {
+    setShowLanding(false);
+    setActive(hasProgress ? firstIncompleteStepIndex : 0);
+  };
+
+  const handleStartOverClick = () => setShowStartOverModal(true);
+
+  const lockAndProceed = async () => {
+    if (!blueprintReady || !releaseReady || lockAndProceedLoading) return;
+    const ephemeralSecret = (state.blueprint?.blueprintPullSecretEphemeral || "").trim();
+    const secretValid = ephemeralSecret && validateBlueprintPullSecretOptional(ephemeralSecret).valid;
+    setLockAndProceedLoading(true);
+    try {
+      const data = await apiFetch("/api/operators/confirm", { method: "POST" });
+      updateState({
+        blueprint: {
+          ...state.blueprint,
+          confirmed: true,
+          confirmationTimestamp: Date.now(),
+          ...(state.blueprint?.blueprintRetainPullSecret ? {} : { blueprintPullSecretEphemeral: undefined })
+        },
+        release: data.release ?? { ...state.release, confirmed: true },
+        version: data.version ?? state.version,
+        reviewFlags: { ...(state.reviewFlags || {}), blueprint: false, release: false }
+      });
+      setShowCoreLockWarning(false);
+      const patchVersion = data.release?.patchVersion ?? state.release?.patchVersion;
+      if (patchVersion) {
+        apiFetch("/api/aws/warm-installer", {
+          method: "POST",
+          body: JSON.stringify({ version: patchVersion, arch: state.blueprint?.arch })
+        }).catch(() => {});
+      }
+      if (secretValid) {
+        try {
+          const scanData = await apiFetch("/api/operators/scan", {
+            method: "POST",
+            body: JSON.stringify({ pullSecret: ephemeralSecret })
+          });
+          const scanJobs = scanData?.jobs && Object.keys(scanData.jobs).length ? scanData.jobs : {};
+          if (Object.keys(scanJobs).length) {
+            updateState({
+              operators: {
+                ...state.operators,
+                scanJobs
+              }
+            });
+          }
+        } catch {
+          // scan failed; user can start scan from Operators step
+        }
+      }
+      const target = pendingNavIndex ?? active + 1;
+      setPendingNavIndex(null);
+      setActiveStep(target, { skipReviewForStep: "blueprint", markComplete: "blueprint" });
+    } finally {
+      setLockAndProceedLoading(false);
+    }
+  };
+
+  const confirmStartOver = async () => {
+    const nextState = await startOver();
+    if (nextState) setState(nextState);
+    setShowStartOverModal(false);
+    setShowLanding(true);
+    setActive(0);
+  };
+
+  const exportRun = async () => {
+    logAction("export_run");
+    const data = await apiFetch("/api/run/export");
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `airgap-run-${data.runId || "bundle"}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importRun = async (file) => {
+    if (!file) return;
+    logAction("import_run");
+    const text = await file.text();
+    const payload = JSON.parse(text);
+    const data = await apiFetch("/api/run/import", { method: "POST", body: JSON.stringify(payload) });
+    setState(data.state);
+    const imported = data.state?.ui || {};
+    const importedLocked = Boolean(
+      data.state?.blueprint?.confirmed &&
+      (data.state?.version?.versionConfirmed ?? data.state?.release?.confirmed)
+    );
+    if (imported.showLanding === true) {
+      setActive(0);
+      return;
+    }
+    if (!importedLocked) {
+      const blueprintIdx = visibleSteps.findIndex((s) => s.id === "blueprint");
+      setActive(blueprintIdx >= 0 ? blueprintIdx : 0);
+      return;
+    }
+    const stepId = LEGACY_STEP_ID_MAP[imported.activeStepId] || imported.activeStepId || "blueprint";
+    const idx = visibleSteps.findIndex((s) => s.id === stepId);
+    setActive(idx >= 0 ? idx : 0);
+  };
+
+  if (loading || !state) {
+    return <div className="app-loading">Loading Airgap Architect…</div>;
+  }
+
+  if (showLanding) {
+    return (
+      <div className="app-shell">
+        <header className="app-header">
+          <div className="brand">
+            <img
+              className="brand-banner"
+              src="/airgap-architect-banner.png"
+              alt="Red Hat OpenShift Airgap Architect"
+            />
+          </div>
+          <div className="header-actions">
+            {hasProgress ? (
+              <button type="button" className="ghost" onClick={handleStartOverClick}>
+                Start Over
+              </button>
+            ) : null}
+          </div>
+        </header>
+        <div className="app landing-view">
+          <div className="content landing-content">
+            <LandingPage hasProgress={hasProgress} onStartInstall={handleInstallClick} />
+          </div>
+        </div>
+        {showStartOverModal ? (
+          <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="start-over-title">
+            <div className="modal">
+              <h3 id="start-over-title">Start Over</h3>
+              <p className="subtle">
+                This will clear all selections, lock-ins, and user entries, and return you to the landing page.
+              </p>
+              <div className="actions">
+                <button type="button" className="ghost" onClick={() => setShowStartOverModal(false)}>
+                  Cancel
+                </button>
+                <button type="button" className="primary" onClick={confirmStartOver}>
+                  Yes, start over
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  return (
+    <div className="app-shell">
+      {!showLanding ? (
+        <a href="#main-content" className="skip-link">
+          Skip to main content
+        </a>
+      ) : null}
+      <header className="app-header">
+        <div className="brand">
+          <button className="ghost icon-button" onClick={() => setSidebarOpen((prev) => !prev)} aria-label="Toggle navigation">
+            ☰
+          </button>
+          <img
+            className="brand-banner"
+            src="/airgap-architect-banner.png"
+            alt="Red Hat OpenShift Airgap Architect"
+          />
+        </div>
+        <div className="header-actions">
+          <button
+            type="button"
+            className="ghost icon-button"
+            onClick={() => setIsToolsOpen((open) => !open)}
+            title="Tools: theme, export/import, start over, operations"
+            aria-label="Open Tools"
+          >
+            ⚙ Tools
+          </button>
+        </div>
+      </header>
+      {showLanding ? (
+        <div className="app landing-view">
+          <div className="content landing-content">
+            <LandingPage hasProgress={hasProgress} onStartInstall={handleInstallClick} />
+          </div>
+        </div>
+      ) : (
+      <div className="app">
+        <ErrorBoundary fallbackMessage="Navigation error; refresh the page.">
+          <Sidebar
+            steps={sidebarSteps}
+            activeStepId={visibleSteps[active]?.id}
+            onStepClick={(stepId) => attemptNavigate(visibleSteps.findIndex((s) => s.id === stepId))}
+            sidebarOpen={sidebarOpen}
+            setSidebarOpen={setSidebarOpen}
+            reviewFlags={state.reviewFlags || {}}
+            errorFlags={errorFlags}
+            completeFlags={completeFlags}
+            visitedSteps={state.ui?.visitedSteps || {}}
+            operationsCount={jobsCount}
+            foundationalLocked={foundationalLocked}
+            lockToast={lockToast}
+            setLockToast={setLockToast}
+          />
+        </ErrorBoundary>
+        <div className="content">
+          {blockedMessage ? (
+            <div className="blocked-banner" role="alert">
+              <span>{blockedMessage}</span>
+              <button type="button" className="ghost" onClick={() => setBlockedMessage("")}>Dismiss</button>
+            </div>
+          ) : null}
+          <input
+            ref={importRef}
+            type="file"
+            accept=".json"
+            style={{ display: "none" }}
+            onChange={(e) => importRun(e.target.files?.[0])}
+          />
+          {segmentedFlowV1 ? (
+            <div className="scenario-header-wrap">
+              <ScenarioHeaderPanel state={state} />
+            </div>
+          ) : null}
+          <div className="main-layout">
+            <main className="main" id="main-content" aria-label="Wizard step content">
+              <ErrorBoundary fallbackMessage="Something went wrong in this step; refresh or go back.">
+                <Current
+                    previewControls={{ showPreview, setShowPreview }}
+                    previewEnabled={previewEnabled}
+                    highlightErrors={highlightErrors}
+                    fieldErrors={fieldErrors}
+                    incompleteStepLabels={incompleteStepLabels}
+                    onRequestStartOver={handleStartOverClick}
+                  />
+              </ErrorBoundary>
+            </main>
+            {showPreview && previewEnabled ? (
+              <aside className="preview-pane">
+                <div className="card">
+                  <div className="card-header">
+                    <h3>YAML Preview</h3>
+                  </div>
+                  <div className="note">Source: {previewTarget}</div>
+                  {previewLoading ? <div className="loading">Generating preview…</div> : null}
+                  {previewError ? <div className="note warning">{previewError}</div> : null}
+                <pre className="preview">
+                  {previewFiles[previewTarget] || "Not generated yet."}
+                </pre>
+                {extraPreviewFiles.length ? (
+                  <div className="list">
+                    {extraPreviewFiles.map(([name, content]) => (
+                      <div key={name}>
+                        <div className="note">Additional file: {name}</div>
+                        <pre className="preview">{content}</pre>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                </div>
+              </aside>
+            ) : null}
+          </div>
+          <footer className="footer">
+            {visibleSteps[active]?.id !== "operations" ? (
+              <button type="button" className="ghost" onClick={back}>
+                {active === 0 ? "Return to Landing Page" : "Back"}
+              </button>
+            ) : null}
+            <div className="footer-spacer" />
+            <button
+              type="button"
+              className="primary"
+              onClick={() => {
+                const coreLockLocked =
+                  state.blueprint?.confirmed && (state?.version?.versionConfirmed ?? state?.release?.confirmed);
+                if (visibleSteps[active]?.id === "blueprint" && !coreLockLocked) {
+                  setPendingNavIndex(active + 1);
+                  setShowCoreLockWarning(true);
+                  return;
+                }
+                if (active === visibleSteps.length - 1) {
+                  attemptNavigate(firstIncompleteStepIndex);
+                } else {
+                  proceed();
+                }
+              }}
+              disabled={
+                !canProceed ||
+                (visibleSteps[active]?.id === "blueprint" && (!blueprintReady || !releaseReady))
+              }
+            >
+              {active === visibleSteps.length - 1
+                ? "Finish"
+                : visibleSteps[active]?.id === "blueprint" &&
+                    !(state.blueprint?.confirmed && (state?.version?.versionConfirmed ?? state?.release?.confirmed))
+                  ? "Confirm & Proceed"
+                  : visibleSteps[active]?.id === "blueprint"
+                    ? "Proceed"
+                    : "Proceed"}
+            </button>
+          </footer>
+        </div>
+      </div>
+      )}
+        {showCoreLockWarning ? (
+          <div className="modal-backdrop" role="dialog" aria-modal="true">
+            <div className="modal">
+              <h3>Lock foundational selections?</h3>
+              <p className="modal-copy subtle">
+                The following will be locked. You will need to use Start Over to change them later.
+              </p>
+              <dl className="modal-summary">
+                <dt>Target Platform</dt>
+                <dd>{state.blueprint?.platform ?? "—"}</dd>
+                <dt>CPU Architecture</dt>
+                <dd>{state.blueprint?.arch ?? "—"}</dd>
+                <dt>OpenShift release</dt>
+                <dd>
+                  {state.release?.channel && state.release?.patchVersion
+                    ? `stable-${state.release.channel} / ${state.release.patchVersion}`
+                    : "—"}
+                </dd>
+              </dl>
+              <div className="actions">
+                <button type="button" className="ghost" onClick={() => { setShowCoreLockWarning(false); setPendingNavIndex(null); }}>
+                  No, go back
+                </button>
+                <button type="button" className="primary" onClick={lockAndProceed} disabled={!blueprintReady || !releaseReady || lockAndProceedLoading || blueprintPullSecretBlocking}>
+                  {lockAndProceedLoading ? "Locking…" : "Yes, lock selections"}
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+        {showReleaseWarning ? (
+          <div className="modal-backdrop" role="dialog" aria-modal="true">
+            <div className="modal">
+              <h3>Release selection</h3>
+              <p className="subtle">
+                This release selection will be locked from this point, and you&apos;ll need to click Start Over to change it later. Continue?
+              </p>
+              <div className="actions">
+                <button type="button" className="ghost" onClick={() => setShowReleaseWarning(false)}>No</button>
+                <button type="button" className="primary" onClick={confirmReleaseAndProceed} disabled={!releaseReady || confirmingRelease}>
+                  {confirmingRelease ? "…" : "Yes"}
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+        {showBlueprintWarning ? (
+          <div className="modal-backdrop" role="dialog" aria-modal="true">
+            <div className="modal">
+              <h3>Blueprint selection</h3>
+              <p className="subtle">
+                These selections will be locked from this point, and you&apos;ll need to click Start Over to change them later. Continue?
+              </p>
+              <div className="actions">
+                <button type="button" className="ghost" onClick={() => setShowBlueprintWarning(false)}>No</button>
+                <button type="button" className="primary" onClick={confirmBlueprintAndProceed} disabled={!blueprintReady}>
+                  Yes
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+        {validationModal ? (
+          <div className="modal-backdrop" role="dialog" aria-modal="true">
+            <div className="modal">
+              <h3>{validationModal.title}</h3>
+              {validationModal.errors?.length ? (
+                <div className="list">
+                  {validationModal.errors.map((item, idx) => (
+                    <div key={`error-${idx}`} className="note warning">{item}</div>
+                  ))}
+                </div>
+              ) : null}
+              {validationModal.warnings?.length ? (
+                <div className="list">
+                  {validationModal.warnings.map((item, idx) => (
+                    <div key={`warn-${idx}`} className="note">{item}</div>
+                  ))}
+                </div>
+              ) : null}
+              {validationModal.warningNote ? (
+                <div className="note warning">{validationModal.warningNote}</div>
+              ) : null}
+              <div className="actions">
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => {
+                    setValidationModal(null);
+                    setPendingNavIndex(null);
+                    setHighlightErrors(true);
+                  }}
+                >
+                  Cancel
+                </button>
+                {validationModal.allowProceed ? (
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={() => {
+                      const target = pendingNavIndex ?? active + 1;
+                      setValidationModal(null);
+                      setPendingNavIndex(null);
+                      setHighlightErrors(false);
+                      setActiveStep(target, {});
+                    }}
+                  >
+                    I understand, proceed anyway
+                  </button>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        ) : null}
+        {showStartOverModal ? (
+          <div className="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="start-over-title">
+            <div className="modal">
+              <h3 id="start-over-title">Start Over</h3>
+              <p className="subtle">
+                This will clear all selections, lock-ins, and user entries, and return you to the landing page.
+              </p>
+              <div className="actions">
+                <button type="button" className="ghost" onClick={() => setShowStartOverModal(false)}>
+                  Cancel
+                </button>
+                <button type="button" className="primary" onClick={confirmStartOver}>
+                  Yes, start over
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+        <ToolsDrawer
+          isOpen={isToolsOpen}
+          onClose={() => setIsToolsOpen(false)}
+          theme={theme}
+          setTheme={setTheme}
+          onExportRun={exportRun}
+          onImportClick={() => importRef.current?.click()}
+          onStartOver={handleStartOverClick}
+          jobsCount={jobsCount}
+          onNavigateToOperations={() => attemptNavigate(visibleSteps.findIndex((s) => s.id === "operations"))}
+          isLocked={foundationalLocked}
+          logAction={logAction}
+        />
+    </div>
+  );
+};
+
+const App = () => (
+  <AppProvider>
+    <ErrorBoundary>
+      <AppShell />
+    </ErrorBoundary>
+  </AppProvider>
+);
+
+export default App;

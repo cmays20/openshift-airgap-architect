@@ -1,0 +1,30 @@
+FROM node:20-bookworm-slim
+
+ARG OCP_CLIENT_URL="https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/openshift-client-linux.tar.gz"
+ARG OCP_MIRROR_URL="https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/oc-mirror.tar.gz"
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends curl ca-certificates tar python3 make g++ libgpgme11 openssh-client \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL "${OCP_CLIENT_URL}" -o /tmp/oc.tgz \
+  && tar -xzf /tmp/oc.tgz -C /usr/local/bin oc \
+  && chmod +x /usr/local/bin/oc \
+  && rm -f /tmp/oc.tgz
+
+RUN curl -fsSL "${OCP_MIRROR_URL}" -o /tmp/oc-mirror.tgz \
+  && tar -xzf /tmp/oc-mirror.tgz -C /usr/local/bin oc-mirror \
+  && chmod +x /usr/local/bin/oc-mirror \
+  && rm -f /tmp/oc-mirror.tgz
+
+WORKDIR /app
+COPY package.json package-lock.json* ./
+RUN npm install --production
+ARG CACHE_BUST=1
+RUN echo "cache bust ${CACHE_BUST}" >/dev/null
+COPY src ./src
+COPY mock-data ./mock-data
+
+ENV NODE_ENV=production
+EXPOSE 4000
+CMD ["node", "src/index.js"]

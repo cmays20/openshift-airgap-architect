@@ -1,0 +1,29 @@
+# install-config with proxy (4.20). Source: 4.20 installing on any platform, proxy section.
+# https://docs.redhat.com/en/documentation/openshift_container_platform/4.20/html/installing_on_any_platform/installing-platform-agnostic
+apiVersion: v1
+baseDomain: example.com
+metadata:
+  name: agent-cluster
+compute:
+  - name: worker
+    replicas: 0
+controlPlane:
+  name: master
+  replicas: 3
+networking:
+  networkType: OVNKubernetes
+  machineNetwork:
+    - cidr: 10.0.0.0/16
+  clusterNetwork:
+    - cidr: 10.128.0.0/14
+      hostPrefix: 23
+  serviceNetwork:
+    - 172.30.0.0/16
+platform:
+  baremetal: {}
+pullSecret: '{"auths":{}}'
+sshKey: ''
+proxy:
+  httpProxy: http://proxy.example.com:3128
+  httpsProxy: https://proxy.example.com:3129
+  noProxy: .example.com,192.168.1.0/24

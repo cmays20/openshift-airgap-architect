@@ -1,0 +1,97 @@
+# Contributing to OpenShift Airgap Architect
+
+## UI Contract (North Star)
+
+- **`docs/UI_NORTH_STAR.md`** is the UI contract for this project.
+- If a change conflicts with it, the change must **STOP** and propose an alternative.
+- No new tabs or steps should be added unless they map to a door in the contract.
+
+## Run and build
+
+- **Docker:** `docker compose up --build`
+- **Podman:** `podman compose up --build`
+- **UI:** http://localhost:5173  
+- **Backend:** http://localhost:4000
+
+If you use `compose down --remove-orphans` followed by `image prune --force` before `compose up --build`, prune may report *image is in use by a container*. That usually means another container (or Podman’s reference) still uses that image; you can ignore it or run `podman container prune -f` (or `docker container prune -f`) first. The app will still run. In the frontend container, *Re-optimizing dependencies because lockfile has changed* is normal when the lockfile or mounts differ from Vite’s cache and is safe to ignore.
+
+## Verify before pushing
+
+Run these from the repo root. They are the same checks CI runs.
+
+```bash
+# Frontend: install, build, and test
+cd frontend && npm ci && npm run test
+# Optional: performance budget after build (BUNDLE_SIZE_LIMIT_KB, default 2048)
+# cd frontend && npm run build && npm run check-size
+
+# Backend: install and test (use npm install if npm ci cannot be used yet)
+cd backend && npm ci && npm test
+```
+
+Optional: `./scripts/check-secrets.sh` to run the secret scanner locally (requires gitleaks).
+
+## Data and frontend copies
+
+**Canonical** parameter catalogs and docs index live at repo root in `data/params/` and `data/docs-index/`. The frontend keeps **copies** under **`frontend/src/data/`** only (`data/catalogs/` and `data/docs-index/`) so the app works in Docker and standalone builds. Do not add copies in other locations. See **`docs/DATA_AND_FRONTEND_COPIES.md`** for the full convention and sync rules.
+
+## Doc index (data/docs-index)
+
+The versioned docs index (`data/docs-index/*.json`) drives which OCP doc links are shown for each scenario. The **canonical base URL is docs.redhat.com** (e.g. `https://docs.redhat.com/en/documentation/openshift_container_platform/4.20/`). The index is the **source of truth** and is **not auto-generated in CI**; CI only runs schema validation. See `docs/DOC_INDEX_RULES.md` for structure and inclusion rules. **Run these from the repo root** (not from `frontend/` or `backend/`):
+
+- **Refresh the index (validate URLs, prune dead links):**
+  ```bash
+  node scripts/refresh-doc-index.js
+  ```
+  This reads `data/docs-index/4.20.json`, checks each doc URL, and overwrites the file with only live URLs. Use `node scripts/refresh-doc-index.js --dry-run` to print a summary without writing.
+
+- **Validate schema (required keys, scenarios object, doc shape):**
+  ```bash
+  node scripts/validate-docs-index.js
+  ```
+  CI runs this on every push/PR. It does not require docs.openshift.com; both docs.redhat.com and docs.openshift.com URLs are allowed. Run it locally after editing any `data/docs-index/*.json` by hand.
+
+## Optional: secret scan (pre-commit)
+
+To avoid committing secrets, run the secret checker before committing:
+
+```bash
+./scripts/check-secrets.sh
+```
+
+This runs **gitleaks** if installed; otherwise it skips (CI runs gitleaks on every push/PR). Install: [gitleaks](https://github.com/gitleaks/gitleaks#installation).
+
+## Optional: pre-commit hooks
+
+```bash
+pip install pre-commit   # or: brew install pre-commit
+pre-commit install
+```
+
+Hooks run on `git commit`; the secret check is included when gitleaks is available.
+
+## Optional: lint and format
+
+- **Lint:** From repo root, `npx eslint backend frontend` (uses `.eslintrc.cjs`). Fix issues before committing if you touch linted files.
+- **Format:** `npx prettier --check .` to check; `npx prettier --write .` to format (respects `.prettierignore`). Not enforced in CI.
+
+## Tests (for agents and contributors)
+
+- **Frontend:** `cd frontend && npm run test` — runs Vitest once (`vitest run`). Frontend tests can live in **`frontend/tests/`** (e.g. routing, step UI, fixtures) or next to source in `frontend/src` (e.g. `LandingPage.smoke.test.jsx`). Add `*.test.jsx` / `*.spec.jsx` in either location for new coverage.
+- **Backend:** `cd backend && npm test` — runs Node `node --test` on `backend/test/`. Add `*.test.js` there; no app code changes required.
+
+When to run: before committing, and after changing backend `src/` or frontend `src/`. CI runs both on push/PR.
+
+**Lockfile and audit:** Do not run `npm audit fix --force` unless explicitly requested; it can cause lockfile churn and breaking dependency upgrades.
+
+## Key outputs (reference)
+
+- `install-config.yaml`
+- `agent-config.yaml` (Bare Metal + Agent-Based only)
+- `imageset-config.yaml` (oc-mirror v2)
+- `FIELD_MANUAL.md`
+- NTP MachineConfigs when NTP is set: `99-chrony-ntp-master.yaml`, `99-chrony-ntp-worker.yaml`
+
+## Project rules
+
+See `.cursor/rules/` and `AGENTS.md` for AI/agent guidance. Align to official OpenShift docs for the selected version (4.17–4.20); do not store or export credentials by default.
