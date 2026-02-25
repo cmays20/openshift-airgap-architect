@@ -98,3 +98,8 @@ docs/TESTING_NOTES.md
 docs/SCENARIO_*
 docs/HANDOFF_*
 docs/DEEP_DIVE_*
+
+# Internal notes (local only)
+docs/LANDING_PAGE_CHANGES.md
+docs/PATTERNFLY_SCOPE.md
+docs/REVIEW_NOTES.md
